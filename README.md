@@ -98,7 +98,11 @@ Requires **macOS** and **Python 3** (both ship with the system). Optional: [`gh`
 
 ## License
 
-[MIT](LICENSE) — do what you like.
+drift is free software, licensed under the [GNU General Public License v3.0](LICENSE).
+
+Copyright (C) 2026 Jean Haley. This program comes with ABSOLUTELY NO WARRANTY.
+You are free to redistribute and modify it under the terms of the GPLv3; any
+distributed derivative must also be released under the GPLv3.
 
 ---
 
