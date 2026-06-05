@@ -96,4 +96,10 @@ Requires **macOS** and **Python 3** (both ship with the system). Optional: [`gh`
 
 ---
 
+## License
+
+[MIT](LICENSE) — do what you like.
+
+---
+
 *drift — see you out there. ✨*
