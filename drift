@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# drift launcher — just run:  ./drift   (pass flags through, e.g. ./drift --hud)
+cd "$(dirname "$0")" || exit 1
+exec python3 drift.py "$@"
