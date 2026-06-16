@@ -231,26 +231,47 @@ def parse_conns(text):
 
 
 def parse_ssid(text):
+    """Current SSID from `networksetup -getairportnetwork`. On macOS 14+ this
+    often reports 'not associated' even while online, so it's only a fallback —
+    parse_wifi (system_profiler) is the primary source."""
     if not text:
         return None
     m = re.search(r"Current Wi-Fi Network:\s*(.+)", text)
     if m:
-        return m.group(1).strip()
+        return m.group(1).strip() or None
     return None
 
 
-def parse_wifi_scan(text):
+def _clean_ssid(name):
+    """macOS 14+ redacts network NAMES to '<redacted>' unless the terminal has
+    Location Services permission. Surface that as 'hidden' (we're connected, we
+    just can't read the name) rather than a blank that looks like 'offline'."""
+    if name in (None, ""):
+        return None
+    if name == "<redacted>":
+        return "hidden"
+    return name
+
+
+def parse_wifi(text):
     """From `system_profiler SPAirPortDataType`, return
-    (current_rssi or None, [(ssid, rssi), ...] for nearby networks)."""
+    (ssid, current_rssi, [(ssid, rssi), ...] for nearby networks).
+    RSSI comes through even when names are redacted by the OS."""
     if not text:
-        return (None, [])
+        return (None, None, [])
+    # current network name lives under "Current Network Information:" (macOS 14+
+    # label; older builds used "Current Wi-Fi Network:")
+    ssid = None
+    cm = re.search(r"Current Network Information:\s*\n\s*(.+?):", text)
+    if cm:
+        ssid = _clean_ssid(cm.group(1).strip())
+    # current link RSSI = the first Signal/Noise in the file (the current net)
     cur_rssi = None
-    neighbors = []
-    # current link RSSI
     m = re.search(r"Signal / Noise:\s*(-?\d+)\s*dBm", text)
     if m:
         cur_rssi = int(m.group(1))
     # nearby networks block: lines "NAME:" then later "Signal / Noise: -xx dBm"
+    neighbors = []
     block = text.split("Other Local Wi-Fi Networks:")
     if len(block) > 1:
         seg = block[1]
@@ -262,9 +283,10 @@ def parse_wifi_scan(text):
                 cur_name = mm.group(1).strip()
             rm = re.search(r"Signal / Noise:\s*(-?\d+)\s*dBm", s)
             if rm and cur_name:
-                neighbors.append((cur_name, int(rm.group(1))))
+                neighbors.append((_clean_ssid(cur_name) or "hidden",
+                                  int(rm.group(1))))
                 cur_name = None
-    return (cur_rssi, neighbors[:12])
+    return (ssid, cur_rssi, neighbors[:12])
 
 
 def parse_boottime(text):
@@ -761,10 +783,12 @@ class Telemetry:
             m = re.search(r"gateway:\s*(\S+)", gout)
             if m:
                 gw = m.group(1)
-        # wifi
-        ssid = parse_ssid(run(["networksetup", "-getairportnetwork", self.iface], 3))
-        rssi, neighbors = parse_wifi_scan(
+        # wifi — system_profiler is the primary source (knows the current SSID
+        # and RSSI even on macOS 14+); networksetup is a last-ditch fallback.
+        ssid, rssi, neighbors = parse_wifi(
             run(["system_profiler", "SPAirPortDataType"], 8))
+        if not ssid:
+            ssid = parse_ssid(run(["networksetup", "-getairportnetwork", self.iface], 3))
         # vpn (utun interface with an inet addr, beyond loopback)
         vpn = False
         ifc = run(["ifconfig"], 3) or ""

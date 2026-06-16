@@ -94,6 +94,8 @@ GitHub stats come from your locally-authenticated `gh` CLI (keyring); the networ
 
 Requires **macOS** and **Python 3** (both ship with the system). Optional: [`gh`](https://cli.github.com/) for the GitHub scenes, Docker for HARBOR, and `pyobjc` for `--global-keys`.
 
+> **Wi-Fi network names:** macOS 14+ redacts Wi-Fi SSIDs (your current network and nearby ones) unless the host terminal has **Location Services** permission — System Settings → Privacy & Security → Location Services → enable it for your terminal app. Without it, drift still shows live signal strength but labels networks as `hidden`.
+
 ---
 
 ## License
