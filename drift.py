@@ -43,6 +43,7 @@ import random
 import re
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -487,6 +488,13 @@ class Telemetry:
         except OSError:
             self.user = os.environ.get("USER", "user")
         self.iface = self._primary_iface()
+        # optional location-authorized Wi-Fi helper (un-redacts SSIDs on macOS
+        # 14+; see wifi-helper/). If the .app isn't built, we fall back to
+        # system_profiler, which shows signal strength but "hidden" names.
+        here = os.path.dirname(os.path.abspath(__file__))
+        app = os.path.join(here, "wifi-helper", "DriftWiFi.app")
+        self.wifi_app = app if os.path.isdir(app) else None
+        self.wifi_out = os.path.join(tempfile.gettempdir(), "drift-wifi.json")
         # shared, normalized-ish data
         self.d = {
             "cpu": 0.0, "load": (0.0, 0.0, 0.0), "mem": 0.0, "disk": 0.0,
@@ -775,6 +783,25 @@ class Telemetry:
             upd["loss"] = bool(loss) and self._ever_latency
         self._set(**upd)
 
+    def _wifi_helper(self):
+        """Read the wifi JSON the helper last wrote, then kick a fresh refresh
+        in the background (via LaunchServices so it runs as its own
+        location-authorized app; `-g` keeps it off-screen, no focus steal).
+        Returns the cached dict (or None). The read is decoupled from the launch
+        so we never block the sampler waiting on the app; the first slow sample
+        seeds the file and later ones see fresh data."""
+        if not self.wifi_app:
+            return None
+        data = None
+        try:
+            with open(self.wifi_out) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = None
+        run(["open", "-g", "-n", self.wifi_app, "--args",
+             "--out", self.wifi_out, "--scan"], 4)
+        return data
+
     def _sample_slow(self):
         # gateway
         gout = run(["route", "-n", "get", "default"], 2)
@@ -783,12 +810,26 @@ class Telemetry:
             m = re.search(r"gateway:\s*(\S+)", gout)
             if m:
                 gw = m.group(1)
-        # wifi — system_profiler is the primary source (knows the current SSID
-        # and RSSI even on macOS 14+); networksetup is a last-ditch fallback.
-        ssid, rssi, neighbors = parse_wifi(
-            run(["system_profiler", "SPAirPortDataType"], 8))
-        if not ssid:
-            ssid = parse_ssid(run(["networksetup", "-getairportnetwork", self.iface], 3))
+        # wifi — prefer the location-authorized helper (real, un-redacted names
+        # on macOS 14+). Falls back to system_profiler (signal strength + "hidden"
+        # names) when the helper isn't built/authorized.
+        ssid = rssi = None
+        neighbors = []
+        # Use the helper if it returned real (un-redacted) data. The "auth" field
+        # is only reliable in --auth mode, so we trust the payload instead: a
+        # real ssid or named neighbors means CoreWLAN was authorized.
+        hw = self._wifi_helper()
+        if hw and hw.get("ok") and (hw.get("ssid") or hw.get("neighbors")):
+            ssid = hw.get("ssid") or None
+            rssi = hw.get("rssi")
+            neighbors = [(n[0], n[1]) for n in hw.get("neighbors", [])
+                         if isinstance(n, list) and len(n) == 2 and n[0]]
+        if ssid is None and rssi is None and not neighbors:
+            ssid, rssi, neighbors = parse_wifi(
+                run(["system_profiler", "SPAirPortDataType"], 8))
+            if not ssid:
+                ssid = parse_ssid(
+                    run(["networksetup", "-getairportnetwork", self.iface], 3))
         # vpn (utun interface with an inet addr, beyond loopback)
         vpn = False
         ifc = run(["ifconfig"], 3) or ""
