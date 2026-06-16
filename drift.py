@@ -1246,10 +1246,11 @@ class SignalScene(Scene):
     def draw(self, scr, frame, st):
         draw_stars(scr, self.stars, frame, C_BLUE)
         cy, cx, pts = getattr(self, "_cache", self._nodes(3))
-        # nearby wifi as faint ambient labels at edges
+        # nearby wifi as faint ambient labels down the left edge (the right side
+        # is reserved for the DECODER HUD, so labels live left to avoid overlap)
         nb = st.get("neighbors") or []
-        for i, (ssid, rssi) in enumerate(nb[:6]):
-            put(scr, 1 + i, self.w - 20, f"{ssid[:14]} {rssi}",
+        for i, (ssid, rssi) in enumerate(nb[:8]):
+            put(scr, 2 + i, 3, f"{ssid[:16]} {rssi}",
                 cp(C_CYAN) | curses.A_DIM)
         # links
         for (py, px) in pts:
