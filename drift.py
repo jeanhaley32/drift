@@ -488,13 +488,20 @@ class Telemetry:
         except OSError:
             self.user = os.environ.get("USER", "user")
         self.iface = self._primary_iface()
-        # optional location-authorized Wi-Fi helper (un-redacts SSIDs on macOS
-        # 14+; see wifi-helper/). If the .app isn't built, we fall back to
-        # system_profiler, which shows signal strength but "hidden" names.
+        # drift's location-authorized Wi-Fi component (un-redacts SSIDs on macOS
+        # 14+). It's a tiny drift-owned .app — the only shape macOS lets a
+        # terminal-launched program hold its own Location grant — that drift
+        # builds, authorizes, and reads on its own. The prompt and the Location
+        # Services entry both read "drift". Falls back to system_profiler
+        # ("hidden" names) if it can't be built/authorized.
         here = os.path.dirname(os.path.abspath(__file__))
-        app = os.path.join(here, "wifi-helper", "DriftWiFi.app")
-        self.wifi_app = app if os.path.isdir(app) else None
+        self.wifi_dir = os.path.join(here, "wifi-helper")
+        self.wifi_app = os.path.join(self.wifi_dir, "DriftWiFi.app")
+        self.wifi_build = os.path.join(self.wifi_dir, "build.sh")
         self.wifi_out = os.path.join(tempfile.gettempdir(), "drift-wifi.json")
+        self._wifi_built_tried = False   # build attempted this session?
+        self._wifi_auth_tried = False    # auth prompt launched this session?
+        self._wifi_ok = False            # have we ever read real, un-redacted data?
         # shared, normalized-ish data
         self.d = {
             "cpu": 0.0, "load": (0.0, 0.0, 0.0), "mem": 0.0, "disk": 0.0,
@@ -783,14 +790,29 @@ class Telemetry:
             upd["loss"] = bool(loss) and self._ever_latency
         self._set(**upd)
 
+    def _wifi_build(self):
+        """Build drift's Wi-Fi component on first need, if swiftc is available.
+        Quiet no-op when already built or when Xcode tools are missing (we just
+        fall back to system_profiler then)."""
+        if self._wifi_built_tried or os.path.isdir(self.wifi_app):
+            return
+        self._wifi_built_tried = True
+        if not (os.path.exists(self.wifi_build) and
+                run(["which", "swiftc"], 3)):
+            return
+        run(["bash", self.wifi_build], 60)
+
     def _wifi_helper(self):
-        """Read the wifi JSON the helper last wrote, then kick a fresh refresh
-        in the background (via LaunchServices so it runs as its own
-        location-authorized app; `-g` keeps it off-screen, no focus steal).
-        Returns the cached dict (or None). The read is decoupled from the launch
-        so we never block the sampler waiting on the app; the first slow sample
-        seeds the file and later ones see fresh data."""
-        if not self.wifi_app:
+        """Read the JSON the Wi-Fi component last wrote, then kick a fresh
+        refresh. The component must run via LaunchServices (`open`) to be its own
+        location-authorized app; the read is decoupled from the launch so the
+        sampler never blocks on it.
+
+        First session-launch uses `--auth` (foreground) so macOS shows the
+        "drift" location prompt once; after we've seen real data — or after that
+        one attempt — we use background `-g` reads (no prompt, no focus steal)."""
+        self._wifi_build()
+        if not os.path.isdir(self.wifi_app):
             return None
         data = None
         try:
@@ -798,8 +820,16 @@ class Telemetry:
                 data = json.load(f)
         except (OSError, ValueError):
             data = None
-        run(["open", "-g", "-n", self.wifi_app, "--args",
-             "--out", self.wifi_out, "--scan"], 4)
+        if data and (data.get("ssid") or data.get("neighbors")):
+            self._wifi_ok = True          # real, un-redacted data has arrived
+        if not self._wifi_ok and not self._wifi_auth_tried:
+            # one-time: trigger the macOS Location prompt for "drift"
+            self._wifi_auth_tried = True
+            run(["open", "-n", self.wifi_app, "--args",
+                 "--auth", "--scan", "--out", self.wifi_out], 4)
+        else:
+            run(["open", "-g", "-n", self.wifi_app, "--args",
+                 "--scan", "--out", self.wifi_out], 4)
         return data
 
     def _sample_slow(self):

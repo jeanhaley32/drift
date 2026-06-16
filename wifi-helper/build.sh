@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="DriftWiFi.app"
-ID="com.jeanhaley32.driftwifi"
+ID="com.jeanhaley32.drift"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
