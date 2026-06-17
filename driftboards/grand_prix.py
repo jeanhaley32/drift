@@ -105,6 +105,52 @@ class GrandPrixBoard(Scene):
             counts[who] = counts.get(who, 0) + 1
         return counts
 
+    def _prs_merged(self, repo, since_iso, until_iso, exclude):
+        """logins -> count of PRs merged in the window for one repo."""
+        q = f"repo:{repo} is:pr is:merged merged:{since_iso}..{until_iso}"
+        out = run(["gh", "api", "--paginate", "-X", "GET", "search/issues",
+                   "--field", f"q={q}", "--field", "per_page=100",
+                   "--jq", '.items[] | (.user.login // "unknown")'], 30)
+        counts = {}
+        for line in (out or "").splitlines():
+            who = line.strip()
+            if not who or who in exclude or who.endswith("[bot]"):
+                continue
+            counts[who] = counts.get(who, 0) + 1
+        return counts
+
+    _REVIEW_Q = ("query($owner:String!,$name:String!){repository(owner:$owner,"
+                 "name:$name){pullRequests(first:50,orderBy:{field:UPDATED_AT,"
+                 "direction:DESC}){nodes{reviews(first:50){nodes{"
+                 "author{login} submittedAt}}}}}}")
+
+    def _reviews(self, repo, start, until, exclude):
+        """logins -> count of PR reviews submitted in the window for one repo.
+        Best-effort: scans the 50 most-recently-updated PRs (cheap, one call)."""
+        try:
+            owner, name = repo.split("/", 1)
+        except ValueError:
+            return {}
+        out = run(["gh", "api", "graphql", "-f", f"query={self._REVIEW_Q}",
+                   "-F", f"owner={owner}", "-F", f"name={name}", "--jq",
+                   ".data.repository.pullRequests.nodes[].reviews.nodes[] | "
+                   '[(.author.login // ""), .submittedAt] | @tsv'], 30)
+        counts = {}
+        for line in (out or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) != 2:
+                continue
+            who, ts = parts[0].strip(), parts[1].strip()
+            if not who or who in exclude or who.endswith("[bot]"):
+                continue
+            try:
+                when = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if start <= when <= until:
+                counts[who] = counts.get(who, 0) + 1
+        return counts
+
     def _season(self, points):
         """Load the season file and compute the standings table."""
         try:
@@ -143,22 +189,30 @@ class GrandPrixBoard(Scene):
         now, start, end = self._bounds(cfg)
         points = cfg.get("points") or [25, 18, 15, 12, 10, 8, 6, 4, 2, 1]
         exclude = set(cfg.get("exclude") or [])
-        weights = cfg.get("weights") or {"commit": 1}
+        weights = cfg.get("weights") or {}
         wc = float(weights.get("commit", 1))
+        wp = float(weights.get("pr", 5))
+        wr = float(weights.get("review", 2))
         state = "pre" if now < start else ("racing" if now < end else "done")
 
         drivers = []
         if state != "pre":
             until = min(now, end)
-            totals = {}
+            sc, sp, sr = {}, {}, {}
             for repo in cfg.get("repos") or []:
                 for who, n in self._commits(repo, start.isoformat(),
                                             until.isoformat(), exclude).items():
-                    totals[who] = totals.get(who, 0) + n
-            drivers = sorted(
-                ({"login": w, "commits": c, "score": c * wc}
-                 for w, c in totals.items()),
-                key=lambda d: -d["score"])
+                    sc[who] = sc.get(who, 0) + n
+                for who, n in self._prs_merged(repo, start.isoformat(),
+                                               until.isoformat(), exclude).items():
+                    sp[who] = sp.get(who, 0) + n
+                for who, n in self._reviews(repo, start, until, exclude).items():
+                    sr[who] = sr.get(who, 0) + n
+            for w in set(sc) | set(sp) | set(sr):
+                c, p, r = sc.get(w, 0), sp.get(w, 0), sr.get(w, 0)
+                drivers.append({"login": w, "commits": c, "prs": p, "reviews": r,
+                                "score": c * wc + p * wp + r * wr})
+            drivers.sort(key=lambda d: -d["score"])
 
         # season: bank today's result once we're past the flag
         doc, races, _ = self._season(points)
@@ -168,12 +222,17 @@ class GrandPrixBoard(Scene):
                        drivers[0]["login"])
         _, races, table = self._season(points)
 
+        span = (end - start).total_seconds()
+        day_frac = clamp(((min(now, end) - start).total_seconds()) / span) \
+            if span > 0 else (1.0 if now >= end else 0.0)
+
         return {"grand_prix": {
             "ok": True, "state": state,
             "drivers": drivers,
             "day_start": start.strftime("%H:%M"),
             "day_end": end.strftime("%H:%M"),
             "now": now.strftime("%H:%M"),
+            "day_frac": day_frac,
             "secs_to_end": max(0, int((end - now).total_seconds())),
             "org": cfg.get("org") or "",
             "season_after": len(races),
@@ -238,13 +297,20 @@ class GrandPrixBoard(Scene):
     def _draw_race(self, scr, gp):
         org = gp.get("org", "")
         flag, fcol = self._flag(gp)
-        put(scr, 3, 3, f"{org}  ·  {gp['day_start']}→{gp['now']}  "
-                       f"(flag {gp['day_end']})", cp_(C_CYAN) | curses.A_DIM)
+        # day clock — the race runs from start-of-day to the end-of-day flag
+        dp = gp.get("day_frac", 0.0)
+        barw = 16
+        fill = int(dp * barw)
+        bar = "▓" * fill + "░" * (barw - fill)
+        center(scr, 3, f"{gp['day_start']}  [{bar}]  {gp['day_end']} 🏁   "
+                       f"{int(dp * 100)}% of the day", cp_(C_CYAN))
         mm, ss = divmod(gp["secs_to_end"], 60)
-        put(scr, 3, self.w - 30, f"{flag}", cp_bold(fcol))
-        if gp["state"] == "racing":
-            put(scr, 4, self.w - 30, f"⏱ {mm//60:02d}:{mm%60:02d}:{ss:02d} to flag",
-                cp_(C_WHITE) | curses.A_DIM)
+        extra = (f"     ⏱ {mm // 60:02d}:{mm % 60:02d}:{ss:02d} to the flag"
+                 if gp["state"] == "racing" else "")
+        center(scr, 4, flag + extra, cp_bold(fcol))
+        put(scr, 5, 3, f"{org}  ·  {len(gp.get('drivers') or [])} on track  "
+                       f"·  scoring: commit×1  PR×5  review×2",
+            cp_(C_WHITE) | curses.A_DIM)
 
         drivers = gp.get("drivers") or []
         if not drivers:
@@ -318,8 +384,12 @@ class GrandPrixBoard(Scene):
     def hud(self, st):
         gp = st.get("grand_prix") or {}
         drivers = gp.get("drivers") or []
+        top = drivers[0] if drivers else None
         return [("grand prix", gp.get("org", "—")),
                 ("flag", gp.get("state", "—")),
-                ("window", f"{gp.get('day_start','?')}→{gp.get('day_end','?')}"),
+                ("day", f"{int(gp.get('day_frac', 0) * 100)}%  "
+                        f"{gp.get('day_start','?')}→{gp.get('day_end','?')}"),
                 ("on track", str(len(drivers))),
-                ("leader", drivers[0]["login"] if drivers else "—")]
+                ("leader", f"{top['login']} {int(top['score'])}" if top else "—"),
+                ("P1 breakdown", f"c{top['commits']} p{top['prs']} r{top['reviews']}"
+                 if top else "—")]
