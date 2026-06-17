@@ -370,8 +370,7 @@ class GrandPrixBoard(Scene):
         extra = (f"     ⏱ {mm // 60:02d}:{mm % 60:02d}:{ss:02d} to the flag"
                  if gp["state"] == "racing" else "")
         center(scr, 4, flag + extra, cp_bold(fcol))
-        put(scr, 5, 3, f"{org}  ·  {len(gp.get('drivers') or [])} on track  "
-                       f"·  PR merged×10  opened×3  review×2  comment×1  commit×1",
+        put(scr, 5, 3, f"{org}  ·  {len(gp.get('drivers') or [])} on track",
             cp_(C_WHITE) | curses.A_DIM)
 
         drivers = gp.get("drivers") or []
@@ -383,7 +382,14 @@ class GrandPrixBoard(Scene):
 
         top = 6
         lane_h = 2
-        n = min(len(drivers), max(1, (self.h - top - 3) // lane_h), 10)
+        # reserve the space below the lanes for the scorecard when the terminal
+        # is tall enough (scorecard ≈ 3 header rows + 1 row per driver).
+        fit = (self.h - top - 5) // (lane_h + 1)
+        show_card = fit >= 2
+        if show_card:
+            n = min(len(drivers), 10, max(1, fit))
+        else:
+            n = min(len(drivers), max(1, (self.h - top - 3) // lane_h), 10)
         track_l, track_r = 9, self.w - 26
         lead = drivers[0]["score"]
         for i in range(n):
@@ -420,9 +426,43 @@ class GrandPrixBoard(Scene):
             if overtaking:
                 put(scr, y, xcar - 9, "⚡OVERTAKE", cp_bold(C_YELLOW))
 
+        if show_card:
+            self._draw_scorecard(scr, top + n * lane_h + 1, drivers, n)
+
         lead_name = drivers[0]["login"]
         put(scr, self.h - 2, 3, f"P1 {lead_name} leads the Grand Prix",
             cp_bold(C_YELLOW))
+
+    # column x-offsets for the scorecard table
+    _SC_COLS = (("POS", 3), ("DRIVER", 7), ("MRG", 26), ("OPN", 32),
+                ("REV", 38), ("COM", 44), ("CMT", 50), ("PTS", 57))
+
+    def _draw_scorecard(self, scr, y0, drivers, n):
+        """Below the lanes: the grading rubric + a per-driver breakdown of how
+        each score is composed (merged / opened / reviews / comments / commits)."""
+        if y0 >= self.h - 2:
+            return
+        put(scr, y0, 3, "── SCORECARD " + "─" * 10, cp_(C_BLUE) | curses.A_DIM)
+        put(scr, y0 + 1, 3,
+            "grading:  PR merged ×10   opened ×3   review ×2   "
+            "comment ×1   commit ×1", cp_(C_CYAN) | curses.A_DIM)
+        hy = y0 + 2
+        for label, x in self._SC_COLS:
+            put(scr, hy, x, label, cp_(C_WHITE) | curses.A_DIM)
+        for i in range(n):
+            ry = hy + 1 + i
+            if ry >= self.h - 2:
+                break
+            d = drivers[i]
+            pcol = POS_COLORS.get(i + 1, C_WHITE)
+            put(scr, ry, 3, f"P{i + 1}", cp_bold(pcol))
+            put(scr, ry, 7, d["login"][:17], cp_(pcol if i < 3 else C_WHITE))
+            for x, v in ((26, d["prs_merged"]), (32, d["prs_open"]),
+                         (38, d["reviews"]), (44, d["review_comments"]),
+                         (50, d["commits"])):
+                put(scr, ry, x, f"{v:>3}", cp_(C_WHITE))
+            put(scr, ry, 57, f"{int(d['score']):>4}",
+                cp_bold(pcol if i < 3 else C_WHITE))
 
     def _draw_standings(self, scr, gp):
         table = gp.get("season") or []
