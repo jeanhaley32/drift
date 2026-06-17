@@ -219,22 +219,30 @@ class GrandPrixBoard(Scene):
         now, start, end = self._bounds(cfg)
         points = cfg.get("points") or [25, 18, 15, 12, 10, 8, 6, 4, 2, 1]
         exclude = set(cfg.get("exclude") or [])
-        # grading rubric (manifest-configurable) — anchored on a shipped PR = 10.
-        # Soft per-category caps keep any single activity from being farmed; only
-        # merged PRs (the real outcome) are uncapped. A cap of None disables it.
+        # grading rubric (manifest-configurable). Each action has a base weight
+        # and a "repeat modifier": the k-th action of a type is worth
+        # weight * modifier**(k-1), so extra actions in one category taper off —
+        # rewarding breadth and resisting farming without a hard cap. A modifier
+        # of 1.0 means linear (no taper). Merged PRs carry the highest base and
+        # the gentlest taper, so shipping still scales.
         weights = cfg.get("weights") or {}
-        w_merged = float(weights.get("pr_merged", 10))
+        w_merged = float(weights.get("pr_merged", 5))
         w_open = float(weights.get("pr_open", 3))
         w_review = float(weights.get("review", 2))         # approve / changes
         w_rcom = float(weights.get("review_comment", 1))   # comment-only
         w_commit = float(weights.get("commit", 1))
-        cap_open = weights.get("pr_open_cap", 9)
-        cap_review = weights.get("review_cap", 12)
-        cap_rcom = weights.get("review_comment_cap", 4)
-        cap_commit = weights.get("commit_cap", 3)   # commits = a small WIP floor
+        m_merged = float(weights.get("pr_merged_mod", 0.85))
+        m_open = float(weights.get("pr_open_mod", 0.6))
+        m_review = float(weights.get("review_mod", 0.7))
+        m_rcom = float(weights.get("review_comment_mod", 0.5))
+        m_commit = float(weights.get("commit_mod", 0.4))
 
-        def capped(pts, cap):
-            return min(pts, float(cap)) if cap is not None else pts
+        def taper(count, weight, mod):
+            if count <= 0:
+                return 0.0
+            if mod == 1.0:
+                return weight * count
+            return weight * (1 - mod ** count) / (1 - mod)
 
         state = "pre" if now < start else ("racing" if now < end else "done")
 
@@ -258,11 +266,11 @@ class GrandPrixBoard(Scene):
             for w in set(sc) | set(so) | set(sm) | set(rs) | set(rc):
                 c, o, m = sc.get(w, 0), so.get(w, 0), sm.get(w, 0)
                 rv, rcm = rs.get(w, 0), rc.get(w, 0)
-                score = (m * w_merged                       # outcome, uncapped
-                         + capped(o * w_open, cap_open)
-                         + capped(rv * w_review, cap_review)
-                         + capped(rcm * w_rcom, cap_rcom)
-                         + capped(c * w_commit, cap_commit))
+                score = (taper(m, w_merged, m_merged)
+                         + taper(o, w_open, m_open)
+                         + taper(rv, w_review, m_review)
+                         + taper(rcm, w_rcom, m_rcom)
+                         + taper(c, w_commit, m_commit))
                 drivers.append({"login": w, "commits": c, "prs_open": o,
                                 "prs_merged": m, "reviews": rv,
                                 "review_comments": rcm, "score": score})
@@ -453,8 +461,8 @@ class GrandPrixBoard(Scene):
             return
         put(scr, y0, 3, "── SCORECARD " + "─" * 10, cp_(C_BLUE) | curses.A_DIM)
         put(scr, y0 + 1, 3,
-            "grading:  PR merged ×10   opened ×3 (≤9)   review ×2 (≤12)   "
-            "comment ×1 (≤4)   commit ×1 (≤3)", cp_(C_CYAN) | curses.A_DIM)
+            "grading:  PR merged ×5   opened ×3   review ×2   comment ×1   "
+            "commit ×1   · repeats taper off", cp_(C_CYAN) | curses.A_DIM)
         hy = y0 + 2
         for label, x in self._SC_COLS:
             put(scr, hy, x, label, cp_(C_WHITE) | curses.A_DIM)
