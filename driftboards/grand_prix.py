@@ -103,7 +103,7 @@ class GrandPrixBoard(Scene):
         out = run(["gh", "api", "--paginate",
                    f"repos/{repo}/commits?since={since_iso}&until={until_iso}"
                    "&per_page=100",
-                   "--jq", '.[] | (.author.login // .commit.author.name // "unknown")'],
+                   "--jq", '.[] | (.author.login // "unknown")'],
                   30)
         counts = {}
         for line in (out or "").splitlines():
@@ -203,11 +203,15 @@ class GrandPrixBoard(Scene):
     def _bank(self, doc, key, order, fastest):
         doc.setdefault("races", {})[key] = {"order": order, "fastest": fastest}
         try:
-            os.makedirs(os.path.dirname(SEASON_FILE), exist_ok=True)
+            # the season file holds colleague logins + rankings — keep it private
+            # to this user (0700 dir / 0600 file) on shared machines.
+            os.makedirs(os.path.dirname(SEASON_FILE), mode=0o700, exist_ok=True)
             tmp = SEASON_FILE + ".tmp"
-            with open(tmp, "w") as f:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 json.dump(doc, f, indent=2)
             os.replace(tmp, SEASON_FILE)
+            os.chmod(SEASON_FILE, 0o600)
         except OSError:
             pass
 
