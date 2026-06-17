@@ -251,10 +251,19 @@ class GrandPrixBoard(Scene):
     def update(self, dt, frame, st):
         self.t += dt
         self.view_t += dt
-        if self.view_t > 14.0:    # alternate RACE / STANDINGS
-            self.view_t = 0.0
-            self.view = "standings" if self.view == "race" else "race"
         gp = st.get("grand_prix") or {}
+        # only alternate to STANDINGS once the season has banked at least one
+        # race — otherwise it's an empty "season starts after…" placeholder that
+        # just interrupts the live race.
+        has_season = bool(gp.get("season"))
+        if self.view_t > 14.0:
+            self.view_t = 0.0
+            if self.view == "race" and has_season:
+                self.view = "standings"
+            else:
+                self.view = "race"
+        if not has_season:
+            self.view = "race"
         drivers = gp.get("drivers") or []
         lead = drivers[0]["score"] if drivers else 0.0
         order = [d["login"] for d in drivers]
