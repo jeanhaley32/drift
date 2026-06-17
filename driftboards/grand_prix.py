@@ -219,14 +219,23 @@ class GrandPrixBoard(Scene):
         now, start, end = self._bounds(cfg)
         points = cfg.get("points") or [25, 18, 15, 12, 10, 8, 6, 4, 2, 1]
         exclude = set(cfg.get("exclude") or [])
-        # grading rubric (manifest-configurable) — anchored on a shipped PR = 10
+        # grading rubric (manifest-configurable) — anchored on a shipped PR = 10.
+        # Soft per-category caps keep any single activity from being farmed; only
+        # merged PRs (the real outcome) are uncapped. A cap of None disables it.
         weights = cfg.get("weights") or {}
         w_merged = float(weights.get("pr_merged", 10))
         w_open = float(weights.get("pr_open", 3))
         w_review = float(weights.get("review", 2))         # approve / changes
         w_rcom = float(weights.get("review_comment", 1))   # comment-only
         w_commit = float(weights.get("commit", 1))
-        commit_cap = weights.get("commit_cap")             # None = uncapped
+        cap_open = weights.get("pr_open_cap", 9)
+        cap_review = weights.get("review_cap", 12)
+        cap_rcom = weights.get("review_comment_cap", 4)
+        cap_commit = weights.get("commit_cap", 3)   # commits = a small WIP floor
+
+        def capped(pts, cap):
+            return min(pts, float(cap)) if cap is not None else pts
+
         state = "pre" if now < start else ("racing" if now < end else "done")
 
         drivers = []
@@ -249,11 +258,11 @@ class GrandPrixBoard(Scene):
             for w in set(sc) | set(so) | set(sm) | set(rs) | set(rc):
                 c, o, m = sc.get(w, 0), so.get(w, 0), sm.get(w, 0)
                 rv, rcm = rs.get(w, 0), rc.get(w, 0)
-                commit_pts = c * w_commit
-                if commit_cap is not None:
-                    commit_pts = min(commit_pts, float(commit_cap))
-                score = (m * w_merged + o * w_open + rv * w_review
-                         + rcm * w_rcom + commit_pts)
+                score = (m * w_merged                       # outcome, uncapped
+                         + capped(o * w_open, cap_open)
+                         + capped(rv * w_review, cap_review)
+                         + capped(rcm * w_rcom, cap_rcom)
+                         + capped(c * w_commit, cap_commit))
                 drivers.append({"login": w, "commits": c, "prs_open": o,
                                 "prs_merged": m, "reviews": rv,
                                 "review_comments": rcm, "score": score})
@@ -444,8 +453,8 @@ class GrandPrixBoard(Scene):
             return
         put(scr, y0, 3, "── SCORECARD " + "─" * 10, cp_(C_BLUE) | curses.A_DIM)
         put(scr, y0 + 1, 3,
-            "grading:  PR merged ×10   opened ×3   review ×2   "
-            "comment ×1   commit ×1", cp_(C_CYAN) | curses.A_DIM)
+            "grading:  PR merged ×10   opened ×3 (≤9)   review ×2 (≤12)   "
+            "comment ×1 (≤4)   commit ×1 (≤3)", cp_(C_CYAN) | curses.A_DIM)
         hy = y0 + 2
         for label, x in self._SC_COLS:
             put(scr, hy, x, label, cp_(C_WHITE) | curses.A_DIM)
