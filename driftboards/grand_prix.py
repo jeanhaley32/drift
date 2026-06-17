@@ -113,9 +113,11 @@ class GrandPrixBoard(Scene):
             counts[who] = counts.get(who, 0) + 1
         return counts
 
-    def _prs_merged(self, repo, since_iso, until_iso, exclude):
-        """logins -> count of PRs merged in the window for one repo."""
-        q = f"repo:{repo} is:pr is:merged merged:{since_iso}..{until_iso}"
+    def _pr_search(self, repo, qualifier, since_iso, until_iso, exclude):
+        """logins -> PR count for a search qualifier (e.g. 'is:merged merged' or
+        'created') over the window."""
+        field, rng = qualifier
+        q = f"repo:{repo} is:pr {field} {rng}:{since_iso}..{until_iso}"
         out = run(["gh", "api", "--paginate", "-X", "GET", "search/issues",
                    "--field", f"q={q}", "--field", "per_page=100",
                    "--jq", '.items[] | (.user.login // "unknown")'], 30)
@@ -127,37 +129,53 @@ class GrandPrixBoard(Scene):
             counts[who] = counts.get(who, 0) + 1
         return counts
 
+    def _prs_merged(self, repo, since_iso, until_iso, exclude):
+        return self._pr_search(repo, ("is:merged", "merged"),
+                               since_iso, until_iso, exclude)
+
+    def _prs_opened(self, repo, since_iso, until_iso, exclude):
+        return self._pr_search(repo, ("", "created"),
+                               since_iso, until_iso, exclude)
+
     _REVIEW_Q = ("query($owner:String!,$name:String!){repository(owner:$owner,"
                  "name:$name){pullRequests(first:50,orderBy:{field:UPDATED_AT,"
                  "direction:DESC}){nodes{reviews(first:50){nodes{"
-                 "author{login} submittedAt}}}}}}")
+                 "author{login} submittedAt state}}}}}}")
+
+    # which review states count as "substantive" vs a drive-by comment
+    _SUBSTANTIVE = {"APPROVED", "CHANGES_REQUESTED"}
 
     def _reviews(self, repo, start, until, exclude):
-        """logins -> count of PR reviews submitted in the window for one repo.
-        Best-effort: scans the 50 most-recently-updated PRs (cheap, one call)."""
+        """Return (substantive, comment) dicts of login -> count for PR reviews
+        submitted in the window. Substantive = approve / changes-requested;
+        comment = comment-only. Scans the 50 most-recently-updated PRs."""
+        sub, com = {}, {}
         try:
             owner, name = repo.split("/", 1)
         except ValueError:
-            return {}
+            return sub, com
         out = run(["gh", "api", "graphql", "-f", f"query={self._REVIEW_Q}",
                    "-F", f"owner={owner}", "-F", f"name={name}", "--jq",
                    ".data.repository.pullRequests.nodes[].reviews.nodes[] | "
-                   '[(.author.login // ""), .submittedAt] | @tsv'], 30)
-        counts = {}
+                   '[(.author.login // ""), .submittedAt, .state] | @tsv'], 30)
         for line in (out or "").splitlines():
             parts = line.split("\t")
-            if len(parts) != 2:
+            if len(parts) != 3:
                 continue
-            who, ts = parts[0].strip(), parts[1].strip()
+            who, ts, state = parts[0].strip(), parts[1].strip(), parts[2].strip()
             if not who or who in exclude or who.endswith("[bot]"):
                 continue
             try:
                 when = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             except ValueError:
                 continue
-            if start <= when <= until:
-                counts[who] = counts.get(who, 0) + 1
-        return counts
+            if not (start <= when <= until):
+                continue
+            if state in self._SUBSTANTIVE:
+                sub[who] = sub.get(who, 0) + 1
+            elif state == "COMMENTED":
+                com[who] = com.get(who, 0) + 1
+        return sub, com
 
     def _season(self, points):
         """Load the season file and compute the standings table."""
@@ -197,29 +215,44 @@ class GrandPrixBoard(Scene):
         now, start, end = self._bounds(cfg)
         points = cfg.get("points") or [25, 18, 15, 12, 10, 8, 6, 4, 2, 1]
         exclude = set(cfg.get("exclude") or [])
+        # grading rubric (manifest-configurable) — anchored on a shipped PR = 10
         weights = cfg.get("weights") or {}
-        wc = float(weights.get("commit", 1))
-        wp = float(weights.get("pr", 5))
-        wr = float(weights.get("review", 2))
+        w_merged = float(weights.get("pr_merged", 10))
+        w_open = float(weights.get("pr_open", 3))
+        w_review = float(weights.get("review", 2))         # approve / changes
+        w_rcom = float(weights.get("review_comment", 1))   # comment-only
+        w_commit = float(weights.get("commit", 1))
+        commit_cap = weights.get("commit_cap")             # None = uncapped
         state = "pre" if now < start else ("racing" if now < end else "done")
 
         drivers = []
         if state != "pre":
             until = min(now, end)
-            sc, sp, sr = {}, {}, {}
+            sc, so, sm, rs, rc = {}, {}, {}, {}, {}
             for repo in cfg.get("repos") or []:
-                for who, n in self._commits(repo, start.isoformat(),
-                                            until.isoformat(), exclude).items():
+                si, ui = start.isoformat(), until.isoformat()
+                for who, n in self._commits(repo, si, ui, exclude).items():
                     sc[who] = sc.get(who, 0) + n
-                for who, n in self._prs_merged(repo, start.isoformat(),
-                                               until.isoformat(), exclude).items():
-                    sp[who] = sp.get(who, 0) + n
-                for who, n in self._reviews(repo, start, until, exclude).items():
-                    sr[who] = sr.get(who, 0) + n
-            for w in set(sc) | set(sp) | set(sr):
-                c, p, r = sc.get(w, 0), sp.get(w, 0), sr.get(w, 0)
-                drivers.append({"login": w, "commits": c, "prs": p, "reviews": r,
-                                "score": c * wc + p * wp + r * wr})
+                for who, n in self._prs_opened(repo, si, ui, exclude).items():
+                    so[who] = so.get(who, 0) + n
+                for who, n in self._prs_merged(repo, si, ui, exclude).items():
+                    sm[who] = sm.get(who, 0) + n
+                sub, com = self._reviews(repo, start, until, exclude)
+                for who, n in sub.items():
+                    rs[who] = rs.get(who, 0) + n
+                for who, n in com.items():
+                    rc[who] = rc.get(who, 0) + n
+            for w in set(sc) | set(so) | set(sm) | set(rs) | set(rc):
+                c, o, m = sc.get(w, 0), so.get(w, 0), sm.get(w, 0)
+                rv, rcm = rs.get(w, 0), rc.get(w, 0)
+                commit_pts = c * w_commit
+                if commit_cap is not None:
+                    commit_pts = min(commit_pts, float(commit_cap))
+                score = (m * w_merged + o * w_open + rv * w_review
+                         + rcm * w_rcom + commit_pts)
+                drivers.append({"login": w, "commits": c, "prs_open": o,
+                                "prs_merged": m, "reviews": rv,
+                                "review_comments": rcm, "score": score})
             drivers.sort(key=lambda d: -d["score"])
 
         # season: bank today's result once we're past the flag
@@ -334,7 +367,7 @@ class GrandPrixBoard(Scene):
                  if gp["state"] == "racing" else "")
         center(scr, 4, flag + extra, cp_bold(fcol))
         put(scr, 5, 3, f"{org}  ·  {len(gp.get('drivers') or [])} on track  "
-                       f"·  scoring: commit×1  PR×5  review×2",
+                       f"·  PR merged×10  opened×3  review×2  comment×1  commit×1",
             cp_(C_WHITE) | curses.A_DIM)
 
         drivers = gp.get("drivers") or []
@@ -422,5 +455,7 @@ class GrandPrixBoard(Scene):
                         f"{gp.get('day_start','?')}→{gp.get('day_end','?')}"),
                 ("on track", str(len(drivers))),
                 ("leader", f"{top['login']} {int(top['score'])}" if top else "—"),
-                ("P1 breakdown", f"c{top['commits']} p{top['prs']} r{top['reviews']}"
+                ("P1 breakdown",
+                 (f"merged{top['prs_merged']} open{top['prs_open']} "
+                  f"rev{top['reviews']}+{top['review_comments']} c{top['commits']}")
                  if top else "—")]
