@@ -36,7 +36,15 @@ def cp_(n):
 def cp_bold(n):
     return cp(n) | curses.A_BOLD
 
-CAR = "‹o═o›"                      # the chassis
+CAR_LEN = 5                        # chassis is "‹o═o▸" — tail, 2 wheels, nose
+WHEELS = ("◍", "◉")               # alternated per frame to look like rolling
+
+
+def car_sprite(frame, moving):
+    """The chassis with rolling wheels: ‹◍═◍▸ / ‹◉═◉▸. Wheels spin faster when
+    the car is moving up the order."""
+    w = WHEELS[(frame // (2 if moving else 4)) % 2]
+    return f"‹{w}═{w}▸"
 POS_COLORS = {1: C_YELLOW, 2: C_WHITE, 3: C_RED}   # gold / silver / bronze-ish
 SEASON_FILE = os.path.expanduser("~/.drift/championship.json")
 
@@ -247,6 +255,7 @@ class GrandPrixBoard(Scene):
         self.view = "race"
         self.prev_order = []
         self.flash = {}           # login -> overtake flash timer
+        self.boost = {}           # login -> "pulling ahead" timer (drives exhaust)
 
     def update(self, dt, frame, st):
         self.t += dt
@@ -275,11 +284,18 @@ class GrandPrixBoard(Scene):
         self.prev_order = order
         for k in list(self.flash):
             self.flash[k] = max(0.0, self.flash[k] - dt)
-        # ease each car toward its score-based target fraction
+        # ease each car toward its score-based target fraction; a car whose
+        # position is advancing is "pulling ahead" -> earns an exhaust trail
         for d in drivers:
+            login = d["login"]
             target = (d["score"] / lead) if lead > 0 else 0.0
-            cur = self.disp.get(d["login"], 0.0)
-            self.disp[d["login"]] = cur + (target - cur) * min(1.0, dt * 1.5)
+            cur = self.disp.get(login, 0.0)
+            nxt = cur + (target - cur) * min(1.0, dt * 1.5)
+            if nxt > cur + 0.0008:                    # gaining track position
+                self.boost[login] = 0.8
+            self.disp[login] = nxt
+        for k in list(self.boost):
+            self.boost[k] = max(0.0, self.boost[k] - dt)
 
     def _flag(self, gp):
         return {"pre": ("◉ LIGHTS OUT — FORMATION LAP", C_RED),
@@ -301,9 +317,9 @@ class GrandPrixBoard(Scene):
         if self.view == "standings":
             self._draw_standings(scr, gp)
         else:
-            self._draw_race(scr, gp)
+            self._draw_race(scr, frame, gp)
 
-    def _draw_race(self, scr, gp):
+    def _draw_race(self, scr, frame, gp):
         org = gp.get("org", "")
         flag, fcol = self._flag(gp)
         # day clock — the race runs from start-of-day to the end-of-day flag
@@ -345,20 +361,26 @@ class GrandPrixBoard(Scene):
             putch(scr, y, track_r, "|", cp_(C_WHITE))     # finish line
             # the car (eased position)
             frac = clamp(self.disp.get(d["login"], 0.0))
-            xcar = int(lerp(track_l, track_r - len(CAR), frac))
-            moving = self.flash.get(d["login"], 0.0) > 0
-            if xcar > track_l + 1:                     # exhaust / speed lines
-                putch(scr, y, xcar - 1, "≈" if moving else "·",
-                      cp_(C_YELLOW) | curses.A_DIM)
-            carcol = C_GREEN if moving else pcol
-            put(scr, y, xcar, CAR, cp_bold(carcol))
+            xcar = int(lerp(track_l, track_r - CAR_LEN, frac))
+            overtaking = self.flash.get(d["login"], 0.0) > 0
+            pulling = overtaking or self.boost.get(d["login"], 0.0) > 0
+            # exhaust trails BEHIND the car (it travels right, so puffs go left)
+            if pulling:
+                for j, ch in enumerate(("≈", "≈", "~", "·"), start=1):
+                    ex = xcar - j
+                    if ex <= track_l:
+                        break
+                    a = curses.A_BOLD if j <= 2 else curses.A_DIM
+                    putch(scr, y, ex, ch, cp_(C_YELLOW) | a)
+            carcol = C_GREEN if pulling else pcol
+            put(scr, y, xcar, car_sprite(frame, pulling), cp_bold(carcol))
             # label + gap to leader
             gap = lead - d["score"]
             tag = (f"{d['login'][:16]}  {int(d['score'])}"
                    + ("" if i == 0 else f"  +{int(gap)}"))
             put(scr, y, track_r + 2, tag,
                 cp_bold(pcol) if i < 3 else cp_(C_WHITE))
-            if moving:
+            if overtaking:
                 put(scr, y, xcar - 9, "⚡OVERTAKE", cp_bold(C_YELLOW))
 
         lead_name = drivers[0]["login"]
