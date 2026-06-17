@@ -1,0 +1,30 @@
+{
+  "//": "Copy this to driftboards.json (gitignored) to customize which boards drift shows.",
+  "//rotation": "Optional. Overrides per-scene timing and the auto-rotate lock.",
+  "rotation": { "min_secs": 45, "max_secs": 110, "lock": false },
+
+  "//boards": "Ordered list of board instances. `type` = a board name (built-in or a plugin in driftboards/). `label` is optional. `config` is passed to the board.",
+  "boards": [
+    { "type": "grand_prix",
+      "label": "daily GP",
+      "config": {
+        "org": "your-org",
+        "repos": ["your-org/backend", "your-org/frontend"],
+        "day_start": "07:00",
+        "day_end": "18:00",
+        "tz": "America/New_York",
+        "weights": { "commit": 1 },
+        "points": [25, 18, 15, 12, 10, 8, 6, 4, 2, 1],
+        "exclude": ["dependabot[bot]", "github-actions[bot]"]
+      } },
+
+    { "type": "cosmos" },
+    { "type": "signal" },
+    { "type": "boiler" },
+    { "type": "sockets" },
+    { "type": "grid" },
+    { "type": "harbor" },
+    { "type": "github" },
+    { "type": "octopet" }
+  ]
+}

@@ -4,3 +4,6 @@ __pycache__/
 
 # built Wi-Fi helper app (rebuild locally via wifi-helper/setup.sh)
 wifi-helper/DriftWiFi.app/
+
+# local board manifest — may name private repos; copy driftboards.example.json
+driftboards.json

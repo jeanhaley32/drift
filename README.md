@@ -22,7 +22,7 @@ That's it. macOS, pure standard-library Python 3, plus a handful of cheap shell 
 |-------|---------------|---------------------|
 | **COSMOS** | Retro space — stars, a planet, meteors, a UFO, a rocket | meteors = download rate · rocket climb = CPU · pulse rings = latency · star cluster = nearby Wi-Fi |
 | **BOILER** | Steampunk machine room — gauges, gears, pistons, steam | gauges = CPU/MEM/NET · steam = memory · valve flash = CPU spike |
-| **SIGNAL** | Live network node-graph | nodes = TCP connections · packets = throughput · pulse = latency |
+| **SIGNAL** | Live Wi-Fi neighborhood radar | hub = connected network · spokes = nearby networks (closer = stronger) · sweep pings each node |
 | **SOCKETS** | A patch-bay of individual connections, one row each | each row's flow = *that* socket's real bytes/sec · color = remote port |
 | **NET GRID** | Cyberpunk data-tower skyline | tower height = socket activity over a rolling window · ▲▼ pulses = live up/down |
 | **HARBOR** | Your Docker fleet as ships in a harbor | cargo = memory · funnel smoke = CPU · wake = net I/O · crew = PIDs |
@@ -94,7 +94,28 @@ GitHub stats come from your locally-authenticated `gh` CLI (keyring); the networ
 
 Requires **macOS** and **Python 3** (both ship with the system). Optional: [`gh`](https://cli.github.com/) for the GitHub scenes, Docker for HARBOR, and `pyobjc` for `--global-keys`.
 
-> **Wi-Fi network names:** macOS 14+ redacts Wi-Fi SSIDs (your current network and nearby ones) unless the host terminal has **Location Services** permission — System Settings → Privacy & Security → Location Services → enable it for your terminal app. Without it, drift still shows live signal strength but labels networks as `hidden`.
+> **Wi-Fi network names:** macOS 14+ redacts Wi-Fi SSIDs unless the reading app holds **Location Services** permission. drift ships a tiny location-aware helper (`wifi-helper/`) that it builds and authorizes on first run — the prompt and Location Services entry read "drift". Without it (e.g. no Xcode tools), drift still shows live signal strength but labels networks as `hidden`.
+
+---
+
+## Driftboards & the manifest
+
+Every screen is a **driftboard**: a self-contained plugin that renders with the curses toolkit and may pull its own data on a schedule. Boards live in `driftboards/` (and `~/.drift/driftboards/` for your own), self-register, and are addressed by name.
+
+A **manifest** (`driftboards.json`, or `--manifest PATH`) picks which boards to show, in what order, with per-instance config — **no manifest just rotates all available built-ins** (the default). Copy [`driftboards.example.json`](driftboards.example.json) to `driftboards.json` to customize:
+
+```jsonc
+{ "rotation": { "min_secs": 45, "max_secs": 110 },
+  "boards": [
+    { "type": "grand_prix", "config": { "org": "your-org",
+        "repos": ["your-org/backend"], "day_start": "07:00", "day_end": "18:00" } },
+    { "type": "cosmos" }, { "type": "signal" }
+  ] }
+```
+
+**GRAND PRIX** (`driftboards/grand_prix.py`) is the flagship board: a daily Formula-1 championship over your org. Each workday is a Grand Prix — engineers race down a track by *work done* (commits authored in the configured repos between `day_start` and `day_end`), position = score, car speed = recent activity. At the day-end flag the top 10 bank F1 points (25-18-15…) into a **persistent season championship** (`~/.drift/championship.json`); a STANDINGS view shows the cumulative table. Uses your existing `gh` auth — no secret. Secrets never go in the manifest; boards declare required env vars instead.
+
+Writing a board = drop a `@board`-decorated `Scene` subclass in `driftboards/`: define `draw()`, optionally a `fetch(cfg)` + `interval` for data, a `CONFIG` schema, and `available()`.
 
 ---
 
