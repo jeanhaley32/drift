@@ -43,6 +43,7 @@ import random
 import re
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -978,13 +979,39 @@ def plot_line(scr, y0, x0, y1, x1, ch, attr=0):
 # Scene base
 # ----------------------------------------------------------------------------
 class Scene:
+    """Base class for a driftboard. Subclasses render with build/update/draw/hud
+    and may optionally pull their own data via fetch() on a declared interval.
+
+    Board contract (all optional, sensible defaults):
+      name, title              identity (name is the manifest `type`)
+      CONFIG = {key: {...}}     per-instance config schema (validated + defaulted)
+      SECRETS = ["ENV_VAR"]     required env vars (checked by default available())
+      interval = None           seconds between fetch() calls (None = no fetch)
+      available(tele, cfg)      whether this board can run right now
+      fetch(cfg) -> dict        background data pull; merged into the render state
+    """
     name = "scene"
     title = "SCENE"
+    CONFIG = {}
+    SECRETS = []
+    interval = None
 
-    def __init__(self, h, w, tele):
+    def __init__(self, h, w, tele, cfg=None):
         self.tele = tele
+        self.cfg = cfg or {}
         self.h = self.w = 0
         self.resize(h, w)
+
+    @classmethod
+    def available(cls, tele, cfg=None):
+        """Default: available unless a required secret env var is missing."""
+        return all(os.environ.get(k) for k in cls.SECRETS)
+
+    def fetch(self, cfg):
+        """Background data pull (runs off the render thread). Return a dict that
+        gets merged into the render state under this board's namespace. Default
+        no-op for boards that only consume shared telemetry."""
+        return {}
 
     def resize(self, h, w):
         self.h, self.w = h, w
@@ -1002,6 +1029,18 @@ class Scene:
     def hud(self, st):
         """Return list of (label, value) for the decoder HUD."""
         return []
+
+
+# --- board registry ---------------------------------------------------------
+# Boards self-register here via @board; manifests reference a board by `name`.
+# Built-in boards (this file) and plugin boards (driftboards/*.py) share it.
+BOARDS = {}
+
+
+def board(cls):
+    """Class decorator: register a Board subclass by its `name`."""
+    BOARDS[cls.name] = cls
+    return cls
 
 
 # --- shared starfield ----------------------------------------------------
@@ -2056,6 +2095,85 @@ THEMES = [CosmosScene, BoilerScene, SignalScene, SocketsScene, GridScene,
           HarborScene, GithubScene, OctoPetScene]
 THEME_BY_NAME = {c.name: c for c in THEMES}
 
+# Register the built-in boards. Gating that used to be hardcoded in run_app is
+# expressed as each board's available() below, so the orchestrator just asks.
+for _c in THEMES:
+    BOARDS.setdefault(_c.name, _c)
+HarborScene.available = classmethod(lambda cls, tele, cfg=None: bool(tele.docker_ok))
+GithubScene.available = classmethod(lambda cls, tele, cfg=None: bool(tele.gh_ok))
+OctoPetScene.available = classmethod(lambda cls, tele, cfg=None: bool(tele.gh_ok))
+
+
+# ----------------------------------------------------------------------------
+# Plugin boards + manifest
+# ----------------------------------------------------------------------------
+# Let plugin board files (driftboards/*.py and ~/.drift/driftboards/*.py) import
+# the core via `from driftcore import ...` without re-executing this module.
+sys.modules.setdefault("driftcore", sys.modules[__name__])
+
+
+def load_plugin_boards():
+    """Import every driftboards/*.py so its @board registrations run. Looks
+    next to drift.py and in ~/.drift/driftboards. Import errors are reported but
+    never fatal — a broken plugin shouldn't take drift down."""
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    dirs = [os.path.join(here, "driftboards"),
+            os.path.expanduser("~/.drift/driftboards")]
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".py") or fn.startswith("_"):
+                continue
+            path = os.path.join(d, fn)
+            modname = "driftboard_" + os.path.splitext(fn)[0]
+            try:
+                spec = importlib.util.spec_from_file_location(modname, path)
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[modname] = mod
+                spec.loader.exec_module(mod)
+            except Exception as e:                       # never fatal
+                sys.stderr.write(f"drift: skipped plugin {fn}: {e}\n")
+
+
+def validate_config(cls, cfg):
+    """Apply a board's CONFIG schema to a manifest config dict: fill defaults
+    and cast declared types. Returns a new dict; unknown keys pass through."""
+    out = dict(cfg or {})
+    for key, spec in (cls.CONFIG or {}).items():
+        if key not in out:
+            out[key] = spec.get("default")
+        cast = spec.get("cast")
+        if cast and out[key] is not None:
+            try:
+                out[key] = cast(out[key])
+            except (TypeError, ValueError):
+                out[key] = spec.get("default")
+    return out
+
+
+def load_manifest(path):
+    """Read a driftboards manifest (JSON). Returns (entries, rotation) where
+    entries is a list of {type, label, config} and rotation is a dict of
+    overrides. Returns (None, {}) if there's no manifest (-> default behavior).
+    A malformed manifest is reported and treated as absent."""
+    if not path or not os.path.isfile(path):
+        return None, {}
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"drift: ignoring manifest ({e})\n")
+        return None, {}
+    entries = []
+    for raw in doc.get("boards", []):
+        t = raw.get("type")
+        if t:
+            entries.append({"type": t, "label": raw.get("label"),
+                            "config": raw.get("config", {})})
+    return entries, doc.get("rotation", {})
+
 
 # ----------------------------------------------------------------------------
 # Border, HUD overlay, transitions
@@ -2113,6 +2231,65 @@ def transition(scr, h, w, label, frame_ref):
 
 
 # ----------------------------------------------------------------------------
+# Board resolution (manifest -> rotation of board instances)
+# ----------------------------------------------------------------------------
+def resolve_boards(opts, tele):
+    """Build the rotation as a list of board specs {cls, cfg, label}.
+
+    With a manifest: each entry's type is looked up in the registry, its config
+    validated/defaulted, and it's kept only if available(). Without a manifest
+    (or if it yields nothing usable): every available built-in board, no config
+    — i.e. drift's original behavior is preserved. Returns (specs, rotation)."""
+    entries, rotation = load_manifest(getattr(opts, "manifest", None))
+    specs = []
+    if entries:
+        for e in entries:
+            cls = BOARDS.get(e["type"])
+            if not cls:
+                sys.stderr.write(f"drift: unknown board '{e['type']}'\n")
+                continue
+            cfg = validate_config(cls, e.get("config"))
+            if not cls.available(tele, cfg):
+                continue
+            specs.append({"cls": cls, "cfg": cfg,
+                          "label": e.get("label") or cls.name})
+    if not specs:
+        for cls in THEMES:
+            if cls.available(tele, None):
+                specs.append({"cls": cls, "cfg": {}, "label": cls.name})
+    return specs, rotation
+
+
+def make_board(spec, h, w, tele):
+    return spec["cls"](h, w, tele, spec["cfg"])
+
+
+def start_fetchers(specs, tele):
+    """For every spec whose board declares an `interval`, run its fetch(cfg) on
+    a background daemon thread and stash the latest result in spec['data'] (an
+    atomic dict swap — the render loop reads it lock-free). Fetchers run for the
+    whole session so a board's data is warm before it rotates into view; they
+    stop when tele.running goes False. Exceptions become an {'error': ...} dict
+    rendered as an error card, never a crash."""
+    def loop(spec):
+        cls, cfg = spec["cls"], spec["cfg"]
+        inst = cls.__new__(cls)            # fetch needs no render state
+        inst.tele, inst.cfg = tele, cfg
+        while tele.running:
+            try:
+                spec["data"] = inst.fetch(cfg) or {}
+            except Exception as e:         # noqa: BLE001 — never take drift down
+                spec["data"] = {"error": f"{type(e).__name__}: {e}"}
+            slept = 0.0
+            while tele.running and slept < cls.interval:
+                time.sleep(0.5); slept += 0.5
+    for spec in specs:
+        if spec["cls"].interval:
+            spec.setdefault("data", {})
+            threading.Thread(target=loop, args=(spec,), daemon=True).start()
+
+
+# ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
 def run_app(scr, opts, tele, monitor=None):
@@ -2134,23 +2311,26 @@ def run_app(scr, opts, tele, monitor=None):
     speed = 1.0
 
     h, w = scr.getmaxyx()
-    # rotation pool: include HARBOR / GITHUB / OCTO-PET only when usable
-    order = [t for t in THEMES
-             if (t is not HarborScene or tele.docker_ok)
-             and (t not in (GithubScene, OctoPetScene) or tele.gh_ok)]
-    if opts.theme and opts.theme in THEME_BY_NAME:
-        chosen = THEME_BY_NAME[opts.theme]
-        # ensure the explicitly chosen theme is always in the rotation pool,
-        # even if it'd normally be filtered out (e.g. --theme harbor w/o docker);
-        # otherwise n/p would raise ValueError on order.index(type(scene)).
-        if chosen not in order:
-            order.append(chosen)
-        scene = chosen(h, w, tele)
+    # rotation pool of board specs (from manifest, or all available built-ins)
+    specs, rotation = resolve_boards(opts, tele)
+    start_fetchers(specs, tele)          # background data pulls for fetch boards
+    min_secs = rotation.get("min_secs", opts.min_secs)
+    max_secs = rotation.get("max_secs", opts.max_secs)
+    if opts.theme and opts.theme in BOARDS:
+        # lock to the requested board; ensure it's present so n/p can land on it
+        idx = next((i for i, s in enumerate(specs)
+                    if s["cls"].name == opts.theme), None)
+        if idx is None:
+            specs.append({"cls": BOARDS[opts.theme], "cfg": {},
+                          "label": opts.theme})
+            idx = len(specs) - 1
+        cur = idx
         locked = True
     else:
-        scene = random.choice(order)(h, w, tele)
-        locked = opts.lock
-    seg = random.uniform(opts.min_secs, opts.max_secs)
+        cur = random.randrange(len(specs))
+        locked = rotation.get("lock", opts.lock)
+    scene = make_board(specs[cur], h, w, tele)
+    seg = random.uniform(min_secs, max_secs)
     seg_start = time.time()
     last = time.time()
     aframe = 0.0          # animation clock in REF_FPS "frames" (fps-independent)
@@ -2187,9 +2367,8 @@ def run_app(scr, opts, tele, monitor=None):
             elif k == ord(" "):
                 force_switch = True         # skip now, even if locked
             elif k in (ord("n"), ord("p")):
-                idx = order.index(type(scene))
-                idx = (idx + (1 if k == ord("n") else -1)) % len(order)
-                scene = order[idx](h, w, tele)
+                cur = (cur + (1 if k == ord("n") else -1)) % len(specs)
+                scene = make_board(specs[cur], h, w, tele)
                 seg_start = now
             elif k in (ord("l"), ord("L")):
                 locked = not locked
@@ -2225,15 +2404,20 @@ def run_app(scr, opts, tele, monitor=None):
         st = tele.snapshot()
         st["typing"] = intensity
         st["kps"] = kps
+        bd = specs[cur].get("data")          # active board's fetched data (if any)
+        if bd:
+            st.update(bd)
 
-        # scene rotation
+        # board rotation
         if force_switch or (not locked and (now - seg_start) >= seg):
             force_switch = False
-            nxt = random.choice([t for t in order if t is not type(scene)] or order)
-            if not transition(scr, h, w, nxt.title, frame):
+            choices = [i for i in range(len(specs)) if i != cur] or [cur]
+            cur = random.choice(choices)
+            nxt = specs[cur]
+            if not transition(scr, h, w, nxt["cls"].title, frame):
                 return
-            scene = nxt(h, w, tele)
-            seg = random.uniform(opts.min_secs, opts.max_secs)
+            scene = make_board(nxt, h, w, tele)
+            seg = random.uniform(min_secs, max_secs)
             seg_start = time.time()
             last = time.time()
             continue
@@ -2268,7 +2452,12 @@ def run_app(scr, opts, tele, monitor=None):
 
 def build_parser():
     p = argparse.ArgumentParser(description="drift — an ambient themed terminal.")
-    p.add_argument("--theme", choices=list(THEME_BY_NAME), help="lock to one theme")
+    p.add_argument("--theme", metavar="NAME",
+                   help="lock to one board by name (built-in or plugin)")
+    p.add_argument("--manifest", metavar="PATH",
+                   default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "driftboards.json"),
+                   help="board manifest (JSON); default ./driftboards.json if present")
     p.add_argument("--minutes", type=float, default=0, help="exit after N minutes")
     p.add_argument("--min-secs", type=float, default=45, dest="min_secs",
                    help="min seconds per scene")
@@ -2305,6 +2494,7 @@ def main():
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error:
         pass
+    load_plugin_boards()           # register any driftboards/*.py plugins
     opts = build_parser().parse_args()
     tele = Telemetry(opts)
     tele.start()
