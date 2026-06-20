@@ -1144,7 +1144,11 @@ def load_manifest(path):
         if t:
             entries.append({"type": t, "label": raw.get("label"),
                             "config": raw.get("config", {})})
-    return entries, doc.get("rotation", {})
+    rot = dict(doc.get("rotation", {}))
+    layout = doc.get("layout", {})
+    if isinstance(layout, dict) and "tiles" in layout:
+        rot["tiles"] = layout["tiles"]
+    return entries, rot
 
 
 # ----------------------------------------------------------------------------
@@ -1159,7 +1163,7 @@ def draw_border(scr, h, w, title):
         putch(scr, y, 0, "│", a)
         putch(scr, y, w - 1, "│", a)
     put(scr, 0, 3, f" {title} ", cp(C_WHITE) | curses.A_BOLD)
-    tag = " drift  ·  q quit  space skip  n/p theme  l lock  h hud  f fps  +/- speed "
+    tag = " drift · q quit · space skip · n/p board · 1-4 tiles · l lock · h hud · f fps "
     put(scr, h - 1, max(3, w - len(tag) - 3), tag, a)
 
 
@@ -1200,6 +1204,93 @@ def transition(scr, h, w, label, frame_ref):
         if k in (ord("q"), ord("Q")):
             return False
         time.sleep(0.03)
+
+
+# ----------------------------------------------------------------------------
+# Tiling: a Viewport wraps the real screen with an offset + clip, so a board's
+# put/putch/center (which all go through scr.getmaxyx/addstr/addch) render into
+# one tile thinking they own a full screen of the tile's size — no board changes.
+# ----------------------------------------------------------------------------
+class Viewport:
+    def __init__(self, scr, y0, x0, h, w):
+        self._scr = scr
+        self._y0, self._x0, self._h, self._w = y0, x0, h, w
+
+    def getmaxyx(self):
+        return (self._h, self._w)
+
+    def addstr(self, y, x, text, attr=0):
+        if 0 <= y < self._h and x < self._w:
+            try:
+                self._scr.addstr(self._y0 + y, self._x0 + x, text, attr)
+            except curses.error:
+                pass
+
+    def addch(self, y, x, ch, attr=0):
+        if 0 <= y < self._h and 0 <= x < self._w:
+            try:
+                self._scr.addch(self._y0 + y, self._x0 + x, ch, attr)
+            except curses.error:
+                pass
+
+    def erase(self):
+        pass                       # the parent screen is erased once per frame
+
+
+def tile_rects(h, w, tiles):
+    """Lay out 1–4 tiles as (y0, x0, h, w) rects. 2 = side by side, 3 = one big
+    panel + two stacked, 4 = quadrants."""
+    if tiles <= 1:
+        return [(0, 0, h, w)]
+    if tiles == 2:
+        wl = w // 2
+        return [(0, 0, h, wl), (0, wl, h, w - wl)]
+    if tiles == 3:
+        wl, ht = w // 2, h // 2
+        return [(0, 0, h, wl), (0, wl, ht, w - wl), (ht, wl, h - ht, w - wl)]
+    wl, ht = w // 2, h // 2
+    return [(0, 0, ht, wl), (0, wl, ht, w - wl),
+            (ht, 0, h - ht, wl), (ht, wl, h - ht, w - wl)]
+
+
+def tile_border(vp, title, focused=False, locked=False):
+    """A light box + title for one tile. The focused (selected) tile gets a
+    bright border; a locked tile shows a 🔒 and won't rotate."""
+    h, w = vp.getmaxyx()
+    a = (cp(C_CYAN) | curses.A_BOLD) if focused else (cp(C_BLUE) | curses.A_DIM)
+    for x in range(w):
+        putch(vp, 0, x, "─", a)
+        putch(vp, h - 1, x, "─", a)
+    for y in range(h):
+        putch(vp, y, 0, "│", a)
+        putch(vp, y, w - 1, "│", a)
+    label = (" 🔒 " if locked else " ") + title + " "
+    put(vp, 0, 2, label, cp((C_CYAN if focused else C_WHITE)) | curses.A_BOLD)
+
+
+def move_focus(cur, dirn, rects):
+    """Pick the tile nearest to `cur` in a screen direction ('L','R','U','D'),
+    by tile centers — works for any of the 1–4 layouts. Stays put if none."""
+    y0, x0, th, tw = rects[cur]
+    cy, cx = y0 + th / 2, x0 + tw / 2
+    best, bestd = cur, None
+    for j, (jy0, jx0, jh, jw) in enumerate(rects):
+        if j == cur:
+            continue
+        jy, jx = jy0 + jh / 2, jx0 + jw / 2
+        if dirn == "L" and jx >= cx:
+            continue
+        if dirn == "R" and jx <= cx:
+            continue
+        if dirn == "U" and jy >= cy:
+            continue
+        if dirn == "D" and jy <= cy:
+            continue
+        d = (abs(jx - cx) + abs(jy - cy) * 3 if dirn in ("L", "R")
+             else abs(jy - cy) + abs(jx - cx) * 3)
+        if bestd is None or d < bestd:
+            best, bestd = j, d
+    return best
 
 
 # ----------------------------------------------------------------------------
@@ -1279,7 +1370,6 @@ def run_app(scr, opts, tele, monitor=None):
     frames = 0            # cumulative frames rendered
     fps_meas = fps        # smoothed, actually-achieved frame rate
     kps = 0.0             # smoothed keystrokes/sec (keys typed INTO drift only)
-    ktotal = 0            # cumulative keystrokes
     kacc = 0              # keystrokes seen this frame
     sparks = []           # typing-energy particles: [x,y,vy,vx,char,color]
     speed = 1.0
@@ -1290,26 +1380,53 @@ def run_app(scr, opts, tele, monitor=None):
     start_fetchers(specs, tele)          # background data pulls for fetch boards
     min_secs = rotation.get("min_secs", opts.min_secs)
     max_secs = rotation.get("max_secs", opts.max_secs)
+    lock_all = rotation.get("lock", opts.lock)     # freeze every panel's rotation
+
+    # how many panels to tile (CLI > manifest layout.tiles > 1)
+    tiles = max(1, min(4, opts.tiles or int(rotation.get("tiles") or 1)))
+    theme_lock = None
     if opts.theme and opts.theme in BOARDS:
-        # lock to the requested board; ensure it's present so n/p can land on it
-        idx = next((i for i, s in enumerate(specs)
-                    if s["cls"].name == opts.theme), None)
-        if idx is None:
-            specs.append({"cls": BOARDS[opts.theme], "cfg": {},
-                          "label": opts.theme})
-            idx = len(specs) - 1
-        cur = idx
-        locked = True
-    else:
-        cur = random.randrange(len(specs))
-        locked = rotation.get("lock", opts.lock)
-    scene = make_board(specs[cur], h, w, tele)
-    seg = random.uniform(min_secs, max_secs)
-    seg_start = time.time()
+        tiles, lock_all = 1, True
+        theme_lock = next((i for i, s in enumerate(specs)
+                           if s["cls"].name == opts.theme), None)
+        if theme_lock is None:
+            specs.append({"cls": BOARDS[opts.theme], "cfg": {}, "label": opts.theme})
+            theme_lock = len(specs) - 1
+
+    rects = tile_rects(h, w, tiles)
+
+    def pick(used, own):
+        """A spec index not shown in another tile (and, if possible, not `own`)."""
+        ch = [i for i in range(len(specs)) if i not in used and i != own]
+        if not ch:
+            ch = ([i for i in range(len(specs)) if i not in used]
+                  or [i for i in range(len(specs)) if i != own]
+                  or list(range(len(specs))))
+        return random.choice(ch)
+
+    def new_slots(n):
+        sl, used = [], set()
+        for r in range(n):
+            si = theme_lock if (theme_lock is not None and r == 0) else pick(used, None)
+            used.add(si)
+            sl.append({"i": si, "locked": False,
+                       "scene": make_board(specs[si], rects[r][2], rects[r][3], tele),
+                       "seg": random.uniform(min_secs, max_secs), "start": time.time()})
+        return sl
+
+    def resize_slot(j):
+        slots[j]["scene"].resize(rects[j][2], rects[j][3])
+
+    def set_board(j, ni):
+        slots[j]["i"] = ni
+        slots[j]["scene"] = make_board(specs[ni], rects[j][2], rects[j][3], tele)
+        slots[j]["start"] = time.time()
+
+    slots = new_slots(tiles)
+    focus = 0             # the tile keys act on (Tab to move)
     last = time.time()
     aframe = 0.0          # animation clock in REF_FPS "frames" (fps-independent)
-    force_switch = False
-
+    force_all = False     # space: bring a new board to every unlocked panel now
     end_at = (time.time() + opts.minutes * 60) if opts.minutes else None
 
     while True:
@@ -1320,8 +1437,6 @@ def run_app(scr, opts, tele, monitor=None):
         frames += 1
         if raw_dt > 0:                            # smoothed measured fps (EMA)
             fps_meas += (1.0 / raw_dt - fps_meas) * 0.1
-        # advance the animation clock at the reference rate, not the real fps,
-        # so frame%/frame// cyclic animations don't speed up at higher fps
         aframe += dt * REF_FPS
         frame = int(aframe)
 
@@ -1329,23 +1444,65 @@ def run_app(scr, opts, tele, monitor=None):
         nh, nw = scr.getmaxyx()
         if (nh, nw) != (h, w):
             h, w = nh, nw
-            scene.resize(h, w)
+            rects = tile_rects(h, w, tiles)
+            for r, slot in enumerate(slots):
+                slot["scene"].resize(rects[r][2], rects[r][3])
 
         # input
         k = scr.getch()
         while k != -1:
             if k != curses.KEY_RESIZE:
-                kacc += 1; ktotal += 1     # count every key typed into drift
+                kacc += 1
             if k in (ord("q"), ord("Q")):
                 return
             elif k == ord(" "):
-                force_switch = True         # skip now, even if locked
-            elif k in (ord("n"), ord("p")):
-                cur = (cur + (1 if k == ord("n") else -1)) % len(specs)
-                scene = make_board(specs[cur], h, w, tele)
-                seg_start = now
-            elif k in (ord("l"), ord("L")):
-                locked = not locked
+                force_all = True            # bring new boards to unlocked panels
+            elif k in (ord("1"), ord("2"), ord("3"), ord("4")) and theme_lock is None:
+                tiles = k - ord("0")
+                rects = tile_rects(h, w, tiles)
+                slots = new_slots(tiles)
+                focus = 0
+            # --- select the tile to control (arrow keys / Tab highlight it) ---
+            elif k == curses.KEY_LEFT:
+                focus = move_focus(focus, "L", rects)
+            elif k == curses.KEY_RIGHT:
+                focus = move_focus(focus, "R", rects)
+            elif k == curses.KEY_UP:
+                focus = move_focus(focus, "U", rects)
+            elif k == curses.KEY_DOWN:
+                focus = move_focus(focus, "D", rects)
+            elif k in (ord("\t"), 9):
+                focus = (focus + 1) % len(slots)
+            # --- act on the focused tile ---
+            elif k == ord("l") and theme_lock is None:      # lock/unlock this tile
+                slots[focus]["locked"] = not slots[focus].get("locked")
+            elif k == ord("L"):                              # lock/unlock ALL panels
+                lock_all = not lock_all
+            elif k in (ord("n"), ord("p")) and theme_lock is None:
+                # next / prev dashboard for the focused panel (skip ones shown elsewhere)
+                used = {s["i"] for j, s in enumerate(slots) if j != focus}
+                step = 1 if k == ord("n") else -1
+                ni, guard = (slots[focus]["i"] + step) % len(specs), 0
+                while ni in used and len(specs) > len(slots) and guard < len(specs):
+                    ni = (ni + step) % len(specs); guard += 1
+                set_board(focus, ni)
+            elif k in (ord(","), ord("<")) and theme_lock is None:
+                j = (focus - 1) % len(slots)                # move panel left (swap)
+                slots[focus], slots[j] = slots[j], slots[focus]
+                resize_slot(focus); resize_slot(j); focus = j
+            elif k in (ord("."), ord(">")) and theme_lock is None:
+                j = (focus + 1) % len(slots)                # move panel right (swap)
+                slots[focus], slots[j] = slots[j], slots[focus]
+                resize_slot(focus); resize_slot(j); focus = j
+            elif k in (ord("s"), ord("S")) and theme_lock is None:
+                # shuffle the unlocked panels' positions among themselves
+                mv = [j for j in range(len(slots)) if not slots[j].get("locked")]
+                shuffled = [slots[j] for j in mv]
+                random.shuffle(shuffled)
+                for pos, j in zip(mv, shuffled):
+                    slots[pos] = j
+                for j in mv:
+                    resize_slot(j)
             elif k in (ord("h"), ord("H")):
                 show_hud = not show_hud
             elif k in (ord("f"), ord("F")):
@@ -1363,7 +1520,6 @@ def run_app(scr, opts, tele, monitor=None):
         inst = keys_this / max(raw_dt, 1e-3)
         kps += (inst - kps) * (1 - 0.5 ** (raw_dt / 0.4))   # ~0.4s smoothing
         intensity = clamp(kps / 10.0)                        # ~10 keys/s = full
-        # energy sparks: a burst per keystroke, rising; rate scales with speed
         for _ in range(min(keys_this * 4, 30)):
             sparks.append([float(random.randint(2, max(2, w - 2))), float(h - 2),
                            -random.uniform(0.4, 1.2), random.uniform(-0.25, 0.25),
@@ -1375,52 +1531,69 @@ def run_app(scr, opts, tele, monitor=None):
             s[0] += s[3] * fscale
         sparks = [s for s in sparks if s[1] > 1 and 0 <= s[0] < w]
 
-        st = tele.snapshot()
-        st["typing"] = intensity
-        st["kps"] = kps
-        bd = specs[cur].get("data")          # active board's fetched data (if any)
-        if bd:
-            st.update(bd)
+        base_st = tele.snapshot()
+        base_st["typing"] = intensity
+        base_st["kps"] = kps
 
-        # board rotation
-        if force_switch or (not locked and (now - seg_start) >= seg):
-            force_switch = False
-            choices = [i for i in range(len(specs)) if i != cur] or [cur]
-            cur = random.choice(choices)
-            nxt = specs[cur]
-            if not transition(scr, h, w, nxt["cls"].title, frame):
-                return
-            scene = make_board(nxt, h, w, tele)
-            seg = random.uniform(min_secs, max_secs)
-            seg_start = time.time()
-            last = time.time()
-            continue
+        # per-panel rotation: each tile runs its own timer and never shows a board
+        # already on screen in another tile
+        for idx, slot in enumerate(slots):
+            if slot.get("locked"):
+                continue                          # this tile is locked in place
+            expired = (now - slot["start"]) >= slot["seg"]
+            if not (force_all or (not lock_all and expired)):
+                continue
+            if theme_lock is not None and idx == 0:
+                continue                          # the --theme board stays put
+            used = {s["i"] for j, s in enumerate(slots) if j != idx}
+            ni = pick(used, slot["i"])
+            if tiles == 1 and not force_all:       # keep the solo-board dissolve
+                if not transition(scr, h, w, specs[ni]["cls"].title, frame):
+                    return
+                now = last = time.time()
+            slot["i"] = ni
+            slot["scene"] = make_board(specs[ni], rects[idx][2], rects[idx][3], tele)
+            slot["seg"] = random.uniform(min_secs, max_secs)
+            slot["start"] = time.time()
+        force_all = False
 
-        scene.update(dt, frame, st)
-
+        # draw every panel into its viewport
         scr.erase()
-        scene.draw(scr, frame, st)
-        # typing-energy sparks (global overlay, intensifies as you type faster)
+        for idx, slot in enumerate(slots):
+            y0, x0, th, tw = rects[idx]
+            vp = Viewport(scr, y0, x0, th, tw)
+            data = specs[slot["i"]].get("data")
+            st = dict(base_st)
+            if data:
+                st.update(data)
+            slot["scene"].update(dt, frame, st)
+            slot["scene"].draw(vp, frame, st)
+            if tiles == 1:
+                draw_border(scr, h, w, slot["scene"].title)
+            else:
+                tile_border(vp, slot["scene"].title,
+                            focused=(idx == focus), locked=slot.get("locked"))
+        # typing-energy sparks (global overlay over all panels)
         for s in sparks:
             bright = curses.A_BOLD if s[1] > h * 0.5 else curses.A_DIM
             putch(scr, s[1], s[0], s[4], cp(s[5]) | bright)
-        draw_border(scr, h, w, scene.title)
-        # migration indicator: ⬢ = board loaded from driftboards/ (new plugin
-        # method), ⬡ = still built into drift.py. (Temporary verification aid.)
-        _plugin = type(scene).__module__.startswith("driftboard_")
-        _badge = "⬢ plugin" if _plugin else "⬡ builtin"
-        put(scr, 0, max(3, w - len(_badge) - 4), _badge,
-            cp(C_GREEN if _plugin else C_WHITE)
-            | (curses.A_BOLD if _plugin else curses.A_DIM))
-        if show_hud:
-            draw_hud(scr, h, w, scene, st)
+        # decoder HUD only when a single board fills the screen
+        if show_hud and tiles == 1:
+            s0 = slots[0]
+            hst = dict(base_st, **(specs[s0["i"]].get("data") or {}))
+            draw_hud(scr, h, w, s0["scene"], hst)
         if show_fps:
             wpm = int(kps * 12)                          # ~5 chars/word
             kico = "⌨⚡" if (monitor and monitor.ok) else "⌨"
-            meter = f" {fps_meas:4.1f} fps · frame {frames} · {kico} {kps:4.1f}/s {wpm} wpm "
+            tlabel = f"{tiles} tile" + ("s" if tiles > 1 else "")
+            meter = f" {fps_meas:4.1f} fps · {tlabel} · {kico} {kps:4.1f}/s {wpm} wpm "
             col = C_GREEN if fps_meas >= fps * 0.9 else (
                 C_YELLOW if fps_meas >= fps * 0.6 else C_RED)
             put(scr, h - 1, 3, meter, cp(col) | curses.A_BOLD)
+        if tiles > 1:                                    # global controls hint
+            tag = (" ←↑→↓ select · l lock · n/p board · </> move · "
+                   "s shuffle · 1-4 tiles · q ")
+            put(scr, h - 1, max(3, w - len(tag) - 2), tag, cp(C_BLUE) | curses.A_DIM)
         if monitor and monitor.error:                    # permission/setup hint
             put(scr, 1, 3, f"global keys: {monitor.error}", cp(C_RED) | curses.A_BOLD)
         scr.refresh()
@@ -1448,6 +1621,9 @@ def build_parser():
                    help="target frame rate (default 60; lower to save CPU)")
     p.add_argument("--no-fps-meter", action="store_true", dest="no_fps_meter",
                    help="hide the fps / frame counter (toggle in-app with f)")
+    p.add_argument("--tiles", type=int, default=0, choices=[0, 1, 2, 3, 4],
+                   help="show N driftboards tiled at once (1–4; also keys 1-4 "
+                        "in-app). Default: manifest layout.tiles, else 1")
     p.add_argument("--gh-user", dest="gh_user", metavar="LOGIN",
                    help="show GitHub stats for this account (public data) "
                         "instead of the active gh account")
