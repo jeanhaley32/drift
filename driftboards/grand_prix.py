@@ -1,28 +1,38 @@
-"""GRAND PRIX — a daily Formula-1 championship driftboard.
+"""GRAND PRIX — a sprint-long Formula-1 championship driftboard.
 
-Each workday (day_start..day_end, local) is a Grand Prix: org members race down
-a track by *work done* — commits authored in the configured private repos within
-the window. Position = score, car speed = recent activity. At the day_end flag,
-the top 10 bank F1 points (25-18-15…) into a persistent season championship.
+Each two-week SPRINT is a named Grand Prix (auto-cycling F1 circuits — Monaco,
+Monza, … — plus a sprint number). drift counts its own sprints from 1 on a fixed
+cadence: sprint_anchor is the start date of Sprint 1, and every sprint_days the
+counter advances. (Set sprint_anchor to a real sprint start so the cadence lines
+up with your team's sprints — drift doesn't read Linear at runtime.)
 
-Two views (auto-alternating): RACE (live track) and STANDINGS (season table).
+Every DAY of the sprint is one race: during the workday window (day_start..
+day_end) org members race down the track by *work done* in the configured repos,
+scored by a diminishing-returns rubric (merged PRs, opened PRs, reviews,
+commits). At the day_end flag the finishing order banks F1 points (25-18-15…).
+Those daily points add up into the sprint's Grand Prix scoreboard, and each
+sprint's GP result rolls into a year-long Drivers' Championship.
 
-Data: GitHub commits via `gh api` (uses your existing gh auth — no secret).
-Scoped to the repos listed in config; commit-backboned so private work counts.
+Three auto-rotating views: RACE (today, live) · SPRINT (this GP's board) ·
+SEASON (the championship across all sprints).
+
+Data: GitHub via `gh api` (your existing gh auth — no secret), scoped to the
+configured repos. Results persist in ~/.drift/championship.json.
 
 Manifest example:
   { "type": "grand_prix",
     "config": { "org": "your-org",
                 "repos": ["your-org/backend", "your-org/frontend"],
                 "day_start": "07:00", "day_end": "18:00", "tz": "America/New_York",
-                "weights": {"commit": 1}, "points": [25,18,15,12,10,8,6,4,2,1],
+                "sprint_anchor": "2026-06-15", "sprint_days": 14,
+                "points": [25,18,15,12,10,8,6,4,2,1],
                 "exclude": ["dependabot[bot]"] } }
 """
 import curses
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 from driftcore import (board, Scene, put, putch, center, clamp, lerp, run, cp,
                        C_RED, C_GREEN, C_YELLOW, C_CYAN, C_MAGENTA, C_WHITE,
@@ -48,6 +58,17 @@ def car_sprite(frame, moving):
 POS_COLORS = {1: C_YELLOW, 2: C_WHITE, 3: C_RED}   # gold / silver / bronze-ish
 SEASON_FILE = os.path.expanduser("~/.drift/championship.json")
 
+# One F1-style circuit per sprint, cycling — (flag, name). Overridable via the
+# "circuits" config (a list of names, or of [flag, name] pairs).
+CIRCUITS = [("🇧🇭", "Bahrain"), ("🇸🇦", "Jeddah"), ("🇦🇺", "Melbourne"),
+            ("🇯🇵", "Suzuka"), ("🇨🇳", "Shanghai"), ("🇺🇸", "Miami"),
+            ("🇮🇹", "Imola"), ("🇲🇨", "Monaco"), ("🇨🇦", "Montreal"),
+            ("🇪🇸", "Barcelona"), ("🇦🇹", "Spielberg"), ("🇬🇧", "Silverstone"),
+            ("🇭🇺", "Budapest"), ("🇧🇪", "Spa"), ("🇳🇱", "Zandvoort"),
+            ("🇮🇹", "Monza"), ("🇦🇿", "Baku"), ("🇸🇬", "Singapore"),
+            ("🇺🇸", "Austin"), ("🇲🇽", "Mexico City"), ("🇧🇷", "Interlagos"),
+            ("🇺🇸", "Las Vegas"), ("🇶🇦", "Lusail"), ("🇦🇪", "Abu Dhabi")]
+
 
 def _tz(name):
     if name:
@@ -67,20 +88,27 @@ def _hhmm(s, default):
         return default
 
 
+def _fmt_date(d):
+    return d.strftime("%b ") + str(d.day)              # "Jun 15", no zero-pad
+
+
 @board
 class GrandPrixBoard(Scene):
     name = "grand_prix"
     title = "▚ G R A N D   P R I X ▚"
     interval = 180.0                                   # refresh every 3 min
     CONFIG = {
-        "org":       {"default": None},
-        "repos":     {"default": []},
-        "day_start": {"default": "07:00"},
-        "day_end":   {"default": "18:00"},
-        "tz":        {"default": None},
-        "weights":   {"default": {"commit": 1}},
-        "points":    {"default": [25, 18, 15, 12, 10, 8, 6, 4, 2, 1]},
-        "exclude":   {"default": []},
+        "org":           {"default": None},
+        "repos":         {"default": []},
+        "day_start":     {"default": "07:00"},
+        "day_end":       {"default": "18:00"},
+        "tz":            {"default": None},
+        "sprint_anchor": {"default": "2026-06-15"},   # start date of Sprint 1
+        "sprint_days":   {"default": 14},             # cadence between sprints
+        "circuits":      {"default": None},           # override built-in F1 list
+        "weights":       {"default": {}},
+        "points":        {"default": [25, 18, 15, 12, 10, 8, 6, 4, 2, 1]},
+        "exclude":       {"default": []},
     }
 
     @classmethod
@@ -177,18 +205,19 @@ class GrandPrixBoard(Scene):
                 com[who] = com.get(who, 0) + 1
         return sub, com
 
-    def _season(self, points):
-        """Load the season file and compute the standings table."""
+    def _load(self):
         try:
             with open(SEASON_FILE) as f:
-                doc = json.load(f)
+                return json.load(f)
         except (OSError, ValueError):
-            doc = {"races": {}}
-        races = doc.get("races", {})
+            return {"races": {}}
+
+    @staticmethod
+    def _accumulate(orders, points):
+        """Award finishing-position points across a list of finishing orders
+        (each a list of logins, best first) -> a sorted standings table."""
         agg = {}
-        for _, race in races.items():
-            order = race.get("order", [])
-            won = race.get("fastest")
+        for order in orders:
             for i, login in enumerate(order):
                 a = agg.setdefault(login, {"login": login, "points": 0,
                                            "wins": 0, "podiums": 0})
@@ -197,14 +226,60 @@ class GrandPrixBoard(Scene):
                     a["wins"] += 1
                 if i < 3:
                     a["podiums"] += 1
-        table = sorted(agg.values(), key=lambda r: -r["points"])
-        return doc, races, table
+        return sorted(agg.values(), key=lambda r: -r["points"])
 
-    def _bank(self, doc, key, order, fastest):
-        doc.setdefault("races", {})[key] = {"order": order, "fastest": fastest}
+    # ---- sprint cadence (config-driven; drift counts its own Sprint 1, 2, …) --
+    def _anchor(self, cfg):
         try:
-            # the season file holds colleague logins + rankings — keep it private
-            # to this user (0700 dir / 0600 file) on shared machines.
+            return date.fromisoformat(cfg.get("sprint_anchor") or "2026-06-15")
+        except (ValueError, TypeError):
+            return date(2026, 6, 15)
+
+    def _sdays(self, cfg):
+        try:
+            return max(1, int(cfg.get("sprint_days") or 14))
+        except (ValueError, TypeError):
+            return 14
+
+    def _circuits(self, cfg):
+        c = cfg.get("circuits")
+        if not (isinstance(c, list) and c):
+            return CIRCUITS
+        # accept a list of names or of [flag, name] pairs; normalize to pairs
+        out = []
+        for item in c:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                out.append((item[0], item[1]))
+            else:
+                out.append(("", str(item)))
+        return out
+
+    @staticmethod
+    def _sprint_idx(d, anchor, days):
+        return (d - anchor).days // days            # 0 = the anchor sprint (#1)
+
+    def _sprints(self, races, anchor, days):
+        """Group stored daily race finishing-orders by sprint index."""
+        groups = {}
+        for dstr, race in races.items():
+            try:
+                idx = self._sprint_idx(date.fromisoformat(dstr), anchor, days)
+            except ValueError:
+                continue
+            groups.setdefault(idx, []).append(race.get("order", []))
+        return groups
+
+    def _sprint_meta(self, idx, anchor, days, circuits):
+        """(number, flag, circuit-name, window-string) for a sprint index."""
+        flag, cname = circuits[idx % len(circuits)]
+        s_start = anchor + timedelta(days=idx * days)
+        s_end = s_start + timedelta(days=days - 1)
+        return idx + 1, flag, cname, f"{_fmt_date(s_start)}–{_fmt_date(s_end)}"
+
+    def _save(self, doc):
+        # the season file holds colleague logins + rankings — keep it private
+        # to this user (0700 dir / 0600 file) on shared machines.
+        try:
             os.makedirs(os.path.dirname(SEASON_FILE), mode=0o700, exist_ok=True)
             tmp = SEASON_FILE + ".tmp"
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -214,6 +289,10 @@ class GrandPrixBoard(Scene):
             os.chmod(SEASON_FILE, 0o600)
         except OSError:
             pass
+
+    def _bank(self, doc, key, order, fastest):
+        doc.setdefault("races", {})[key] = {"order": order, "fastest": fastest}
+        self._save(doc)
 
     def fetch(self, cfg):
         now, start, end = self._bounds(cfg)
@@ -276,13 +355,48 @@ class GrandPrixBoard(Scene):
                                 "review_comments": rcm, "score": score})
             drivers.sort(key=lambda d: -d["score"])
 
-        # season: bank today's result once we're past the flag
-        doc, races, _ = self._season(points)
+        # bank today's daily race result once we're past the flag
+        doc = self._load()
+        races = doc.get("races", {})
         key = start.strftime("%Y-%m-%d")
         if state == "done" and key not in races and drivers:
             self._bank(doc, key, [d["login"] for d in drivers[:len(points)]],
                        drivers[0]["login"])
-        _, races, table = self._season(points)
+            races = doc.get("races", {})
+
+        # sprint cadence: which GP are we in right now
+        anchor, days = self._anchor(cfg), self._sdays(cfg)
+        circuits = self._circuits(cfg)
+        today = now.date()
+        idx = self._sprint_idx(today, anchor, days)
+        s_start = anchor + timedelta(days=idx * days)
+        number, flag, cname, window = self._sprint_meta(idx, anchor, days, circuits)
+        groups = self._sprints(races, anchor, days)
+
+        # archive every COMPLETED sprint (its window fully past) exactly once, so
+        # the championship is an immutable record — frozen GP results that never
+        # recompute, not a live re-derivation from raw daily races.
+        archive = doc.get("sprints", {})
+        changed = False
+        for g in sorted(groups):
+            if g < idx and str(g) not in archive:        # finished & not yet stamped
+                order = [r["login"] for r in self._accumulate(groups[g], points)]
+                num, fl, cn, win = self._sprint_meta(g, anchor, days, circuits)
+                archive[str(g)] = {"number": num, "circuit": cn, "flag": fl,
+                                   "window": win, "order": order,
+                                   "winner": order[0] if order else None,
+                                   "stamped": today.isoformat()}
+                changed = True
+        if changed:
+            doc["sprints"] = archive
+            self._save(doc)
+
+        # current sprint board: live from this sprint's daily races (in progress,
+        # NOT yet scored into the championship)
+        sprint_board = self._accumulate(groups.get(idx, []), points)
+        # season championship: only COMPLETED sprints, from their frozen results
+        season_orders = [archive[k]["order"] for k in sorted(archive, key=int)]
+        season_board = self._accumulate(season_orders, points)
 
         span = (end - start).total_seconds()
         day_frac = clamp(((min(now, end) - start).total_seconds()) / span) \
@@ -297,8 +411,16 @@ class GrandPrixBoard(Scene):
             "day_frac": day_frac,
             "secs_to_end": max(0, int((end - now).total_seconds())),
             "org": cfg.get("org") or "",
-            "season_after": len(races),
-            "season": table,
+            "gp_name": f"{cname.upper()} GP",
+            "gp_flag": flag,
+            "sprint_number": number,
+            "sprint_window": window,
+            "race_no": (today - s_start).days + 1,
+            "race_total": days,
+            "races_done": len(groups.get(idx, [])),
+            "sprint_board": sprint_board,
+            "season_board": season_board,
+            "season_sprints": len(archive),
         }}
 
     # ---- rendering --------------------------------------------------------
@@ -306,6 +428,7 @@ class GrandPrixBoard(Scene):
         self.t = 0.0
         self.disp = {}            # login -> displayed track fraction (smoothed)
         self.view_t = 0.0
+        self.view_i = 0           # index into the available views
         self.view = "race"
         self.prev_order = []
         self.flash = {}           # login -> overtake flash timer
@@ -315,18 +438,16 @@ class GrandPrixBoard(Scene):
         self.t += dt
         self.view_t += dt
         gp = st.get("grand_prix") or {}
-        # only alternate to STANDINGS once the season has banked at least one
-        # race — otherwise it's an empty "season starts after…" placeholder that
-        # just interrupts the live race.
-        has_season = bool(gp.get("season"))
+        # rotate RACE -> SPRINT -> SEASON, skipping boards that have no data yet
+        avail = ["race"]
+        if gp.get("sprint_board"):
+            avail.append("sprint")
+        if gp.get("season_board"):
+            avail.append("season")
         if self.view_t > 14.0:
             self.view_t = 0.0
-            if self.view == "race" and has_season:
-                self.view = "standings"
-            else:
-                self.view = "race"
-        if not has_season:
-            self.view = "race"
+            self.view_i += 1
+        self.view = avail[self.view_i % len(avail)]
         drivers = gp.get("drivers") or []
         lead = drivers[0]["score"] if drivers else 0.0
         order = [d["login"] for d in drivers]
@@ -368,8 +489,10 @@ class GrandPrixBoard(Scene):
                 center(scr, self.h // 2, "… waiting for the grid (gh) …",
                        cp_(C_YELLOW) | curses.A_DIM)
             return
-        if self.view == "standings":
-            self._draw_standings(scr, gp)
+        if self.view == "sprint":
+            self._draw_sprint(scr, gp)
+        elif self.view == "season":
+            self._draw_season(scr, gp)
         else:
             self._draw_race(scr, frame, gp)
 
@@ -481,13 +604,14 @@ class GrandPrixBoard(Scene):
             put(scr, ry, 57, f"{int(d['score']):>4}",
                 cp_bold(pcol if i < 3 else C_WHITE))
 
-    def _draw_standings(self, scr, gp):
-        table = gp.get("season") or []
-        center(scr, 3, f"DRIVERS' CHAMPIONSHIP   ·   after {gp['season_after']} races",
-               cp_bold(C_CYAN))
+    def _draw_table(self, scr, title, subtitle, table, win_glyph=None):
+        """Shared standings table (used by SPRINT and SEASON views): a ranked
+        list with a points bar and an optional ×N trophy/win count."""
+        center(scr, 3, title, cp_bold(C_CYAN))
+        if subtitle:
+            center(scr, 4, subtitle, cp_(C_WHITE) | curses.A_DIM)
         if not table:
-            center(scr, self.h // 2,
-                   "season starts after the first " + gp["day_end"] + " flag",
+            center(scr, self.h // 2, "no results banked yet — race on",
                    cp_(C_YELLOW) | curses.A_DIM)
             return
         top = 6
@@ -496,27 +620,36 @@ class GrandPrixBoard(Scene):
         for i in range(n):
             r = table[i]
             y = top + i
-            pos = i + 1
-            pcol = POS_COLORS.get(pos, C_WHITE)
+            pcol = POS_COLORS.get(i + 1, C_WHITE)
             barw = int((r["points"] / maxp) * max(6, self.w // 3))
-            put(scr, y, 3, f"{pos:>2}  {r['login'][:18]:<18}", cp_bold(pcol))
+            put(scr, y, 3, f"{i + 1:>2}  {r['login'][:18]:<18}", cp_bold(pcol))
             put(scr, y, 26, "█" * barw, cp_(pcol))
-            put(scr, y, 26 + barw + 1,
-                f"{r['points']} pts"
-                + (f"  {r['wins']}×\U0001F3C6" if r["wins"] else ""),
-                cp_(C_WHITE) | curses.A_DIM)
+            extra = f"{r['points']} pts"
+            if win_glyph and r.get("wins"):
+                extra += f"  {r['wins']}×{win_glyph}"
+            put(scr, y, 26 + barw + 1, extra, cp_(C_WHITE) | curses.A_DIM)
+
+    def _draw_sprint(self, scr, gp):
+        title = f"{gp.get('gp_flag', '')}  {gp.get('gp_name', 'GRAND PRIX')}".strip()
+        sub = (f"Sprint {gp.get('sprint_number', '?')}  ·  {gp.get('sprint_window', '')}"
+               f"  ·  race {gp.get('race_no', '?')} of {gp.get('race_total', '?')}")
+        # daily race wins this sprint get a chequered flag
+        self._draw_table(scr, title, sub, gp.get("sprint_board") or [], "🏁")
+
+    def _draw_season(self, scr, gp):
+        n = gp.get("season_sprints", 0)
+        sub = f"after {n} Grand Prix" if n == 1 else f"after {n} Grands Prix"
+        # season "wins" = sprints (GPs) won, marked with a trophy
+        self._draw_table(scr, "DRIVERS' CHAMPIONSHIP", sub,
+                         gp.get("season_board") or [], "\U0001F3C6")
 
     def hud(self, st):
         gp = st.get("grand_prix") or {}
-        drivers = gp.get("drivers") or []
-        top = drivers[0] if drivers else None
-        return [("grand prix", gp.get("org", "—")),
-                ("flag", gp.get("state", "—")),
-                ("day", f"{int(gp.get('day_frac', 0) * 100)}%  "
-                        f"{gp.get('day_start','?')}→{gp.get('day_end','?')}"),
-                ("on track", str(len(drivers))),
-                ("leader", f"{top['login']} {int(top['score'])}" if top else "—"),
-                ("P1 breakdown",
-                 (f"merged{top['prs_merged']} open{top['prs_open']} "
-                  f"rev{top['reviews']}+{top['review_comments']} c{top['commits']}")
-                 if top else "—")]
+        sb = gp.get("sprint_board") or []
+        top = sb[0] if sb else None
+        return [("grand prix", f"{gp.get('gp_flag','')} {gp.get('gp_name','—')}".strip()),
+                ("sprint", f"#{gp.get('sprint_number','?')}  {gp.get('sprint_window','')}"),
+                ("race", f"{gp.get('race_no','?')} of {gp.get('race_total','?')}"
+                         f"  ({gp.get('state','—')})"),
+                ("on track", str(len(gp.get("drivers") or []))),
+                ("sprint P1", f"{top['login']} {top['points']}pts" if top else "—")]
