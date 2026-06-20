@@ -7,3 +7,7 @@ wifi-helper/DriftWiFi.app/
 
 # local board manifest — may name private repos; copy driftboards.example.json
 driftboards.json
+
+# ROUTES board hardcodes internal infra specifics (resource-name prefix, service
+# names, ALB topology) — keep local until genericized.
+driftboards/routes.py
