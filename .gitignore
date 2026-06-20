@@ -11,3 +11,7 @@ driftboards.json
 # ROUTES board hardcodes internal infra specifics (resource-name prefix, service
 # names, ALB topology) — keep local until genericized.
 driftboards/routes.py
+
+# Aurora ACU boards — specific to our database fleet; keep local.
+driftboards/aurora_acu.py
+driftboards/aurora_fleet.py

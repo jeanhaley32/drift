@@ -1030,6 +1030,13 @@ class Scene:
         """Return list of (label, value) for the decoder HUD."""
         return []
 
+    def on_key(self, k):
+        """Optional: handle a keystroke while this board is the focused tile.
+        Return True if consumed. Default: ignore. (run_app forwards any key it
+        doesn't itself use to the focused panel — lets a board be interactive,
+        e.g. zoom.)"""
+        return False
+
 
 # --- board registry ---------------------------------------------------------
 # Boards self-register here via @board; manifests reference a board by `name`.
@@ -1511,6 +1518,8 @@ def run_app(scr, opts, tele, monitor=None):
                 speed = min(4.0, speed + 0.25)
             elif k == ord("-"):
                 speed = max(0.25, speed - 0.25)
+            elif 0 <= focus < len(slots):
+                slots[focus]["scene"].on_key(k)   # forward to the focused board
             k = scr.getch()
 
         # typing-rate tracking — in-window keys, plus global key TIMING when the
