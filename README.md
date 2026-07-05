@@ -1,3 +1,4 @@
+
 # drift
 
 **An ambient, themed "living terminal" — part screensaver, part generative art, part glanceable system monitor.**
@@ -5,6 +6,9 @@
 `drift` turns your machine's real telemetry into animated, strongly-themed scenes that cycle on random intervals. CPU load, memory pressure, battery, and a *lot* of network detail aren't just numbers in a corner — they're the material the scenes are made of. Meteors fall at your download rate, steam gauges climb with memory, Docker containers sail in as ships, and your GitHub streak keeps a little ASCII pet happy.
 
 It's the kind of thing you leave running in a spare terminal and glance at.
+
+<img width="1024" height="560" alt="6D39CD39-B04C-49EB-9E82-8A766BC6588D" src="https://github.com/user-attachments/assets/b00f0522-6f49-4c23-b335-9f49b20d7121" />
+
 
 ```
   ./drift
@@ -34,6 +38,10 @@ manifest" below) — it's not one monolithic script.
 | **OCTO-PET** | A Tamagotchi whose mood reflects your GitHub activity | long streak → ecstatic · idleness → sleepy/hungry · orbited by stars/followers/notifs |
 
 HARBOR appears only when a Docker daemon is reachable; GITHUB and OCTO-PET only when the [`gh`](https://cli.github.com/) CLI is authenticated.
+
+
+<img width="680" height="424" alt="1ECCB269-94E1-4959-A3D9-E6C8ED3A5C3E" src="https://github.com/user-attachments/assets/ade75bce-a398-4564-9f56-2bc0ee949b27" />
+
 
 ---
 
