@@ -12,6 +12,10 @@ It's the kind of thing you leave running in a spare terminal and glance at.
 
 That's it. macOS, pure standard-library Python 3, plus a handful of cheap shell tools you already have. No installs, no dependencies.
 
+`./drift` is a tiny launcher shim; `drift.py` is the actual program. Each
+theme lives as its own file under `driftboards/` (see "Driftboards & the
+manifest" below) — it's not one monolithic script.
+
 ---
 
 ## Themes
