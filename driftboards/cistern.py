@@ -88,7 +88,7 @@ class CisternScene(Scene):
             alloc = float(db.get("AllocatedStorage") or 0)        # GiB
             ceiling = float(db.get("MaxAllocatedStorage") or alloc or 1)
             free_b = self._metric(cfg, "FreeStorageSpace", "DBInstanceIdentifier", ident)
-            used = max(0.0, alloc - free_b / (1024 ** 3)) if (free_b and alloc) else None
+            used = max(0.0, alloc - free_b / (1024 ** 3)) if (free_b is not None and alloc) else None
             conns = self._metric(cfg, "DatabaseConnections", "DBInstanceIdentifier", ident)
             vessels.append({
                 "name": ident, "unit": "GB",
