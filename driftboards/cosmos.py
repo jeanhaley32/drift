@@ -103,6 +103,6 @@ class CosmosScene(Scene):
     def hud(self, st):
         d = st["down_kbps"]; u = st["up_kbps"]
         return [("meteors = net down", f"{d:,.0f} KB/s"),
-                ("pulse = latency", f"{st['latency']:.0f} ms" if st['latency'] else "—"),
+                ("pulse = latency", f"{st['latency']:.0f} ms" if st['latency'] is not None else "—"),
                 ("rocket = cpu", f"{st['cpu']*100:.0f}%"),
                 ("stars(L) = nearby wifi", f"{len(st.get('neighbors') or [])} nets")]
