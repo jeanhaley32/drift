@@ -44,7 +44,6 @@ import re
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 
@@ -499,7 +498,11 @@ class Telemetry:
         self.wifi_dir = os.path.join(here, "wifi-helper")
         self.wifi_app = os.path.join(self.wifi_dir, "DriftWiFi.app")
         self.wifi_build = os.path.join(self.wifi_dir, "build.sh")
-        self.wifi_out = os.path.join(tempfile.gettempdir(), "drift-wifi.json")
+        # Keep the Wi-Fi scratch file in a private 0700 dir, not world-writable
+        # /tmp, so another local user can't pre-plant or symlink the path (TOCTOU).
+        drift_home = os.path.expanduser("~/.drift")
+        os.makedirs(drift_home, mode=0o700, exist_ok=True)
+        self.wifi_out = os.path.join(drift_home, "drift-wifi.json")
         self._wifi_built_tried = False   # build attempted this session?
         self._wifi_auth_tried = False    # auth prompt launched this session?
         self._wifi_ok = False            # have we ever read real, un-redacted data?
