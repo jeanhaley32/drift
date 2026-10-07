@@ -44,7 +44,8 @@ class CosmosScene(Scene):
             m[0] += m[2] * 1.2 * f
         self.meteors = [m for m in self.meteors if m[1] < self.h and m[0] < self.w]
         # latency pulse beacon: ring period scales with latency
-        lat = st.get("latency") or 60
+        lat = st.get("latency")
+        lat = 60 if lat is None else lat
         period = clamp(lat / 200.0, 0.15, 1.2) * 2.2
         self.pulse_t += dt
         if self.pulse_t >= period:
@@ -103,6 +104,6 @@ class CosmosScene(Scene):
     def hud(self, st):
         d = st["down_kbps"]; u = st["up_kbps"]
         return [("meteors = net down", f"{d:,.0f} KB/s"),
-                ("pulse = latency", f"{st['latency']:.0f} ms" if st['latency'] else "—"),
+                ("pulse = latency", f"{st['latency']:.0f} ms" if st['latency'] is not None else "—"),
                 ("rocket = cpu", f"{st['cpu']*100:.0f}%"),
                 ("stars(L) = nearby wifi", f"{len(st.get('neighbors') or [])} nets")]
